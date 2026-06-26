@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+pip-log.txt
+pip-delete-this-directory.txt
+.venv/
+
+# Node / Vite
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# SQLite Database & Encryption Key
+minisashimi.db
+.enc_key
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+

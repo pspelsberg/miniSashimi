@@ -1,0 +1,47 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./app:/app/app
+      - db_data:/app
+    environment:
+      - PYTHONUNBUFFERED=1
+      - SASHIMI_ENCRYPTION_KEY=${SASHIMI_ENCRYPTION_KEY:-}
+      - SASHIMI_DASHBOARD_TOKEN=${SASHIMI_DASHBOARD_TOKEN:-}
+      - SASHIMI_ENCRYPTION_SALT=${SASHIMI_ENCRYPTION_SALT:-}
+      - SASHIMI_KEYS_DIR=/app/keys
+      - SASHIMI_AUDIT_DIR=/app/audit
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+    restart: unless-stopped
+
+  dashboard:
+    image: node:20-alpine
+    user: "node"
+    working_dir: /app
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./dashboard:/app
+    command: sh -c "npm run dev -- --host 0.0.0.0"
+    depends_on:
+      - backend
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+    restart: unless-stopped
+
+volumes:
+  db_data:
+

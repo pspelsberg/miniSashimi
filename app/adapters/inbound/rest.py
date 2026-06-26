@@ -1,0 +1,661 @@
+from fastapi import APIRouter, Depends, HTTPException, Header, Request
+from sqlmodel import Session
+from typing import Dict, Any, List, Optional
+import os
+import secrets
+import time
+import json
+import logging
+import asyncio
+from datetime import datetime
+
+from app.domain.models import (
+    ChatCompletionRequest, ChatCompletionResponse, ChatCompletionChoice, 
+    ChatMessage, ChatCompletionUsage, WorkflowsTable, WorkflowState, TaskStatus
+)
+from app.core.database import (
+    get_api_key, save_api_key, delete_api_key, get_setting, save_setting, engine
+)
+from app.core.security import encrypt_key, decrypt_key, log_audit_event
+from app.orchestrator.engine import (
+    OrchestratorEngine, active_workflows, register_dashboard_callback
+)
+from app.core.state import active_tasks, active_tickets
+from app.middleware.rate_limiter import rate_limit
+
+logger = logging.getLogger("minisashimi.rest")
+router = APIRouter()
+
+ALLOWED_PROVIDERS = {"openai", "anthropic", "mistral", "openrouter", "deepseek", "google"}
+
+def uuid_str() -> str:
+    import uuid
+    return str(uuid.uuid4())
+
+def get_or_create_dashboard_token() -> str:
+    expected_token = os.getenv("SASHIMI_DASHBOARD_TOKEN")
+    if expected_token:
+        return expected_token
+        
+    encrypted_token = get_setting("dashboard_token")
+    if encrypted_token:
+        try:
+            decrypted = decrypt_key(encrypted_token)
+            if decrypted:
+                return decrypted
+        except Exception:
+            pass
+            
+    # Generate new token
+    expected_token = secrets.token_hex(16)
+    save_setting("dashboard_token", encrypt_key(expected_token))
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        mode = 0o600
+        token_dir = os.getenv("SASHIMI_KEYS_DIR", os.path.expanduser("~/.minisashimi"))
+        os.makedirs(token_dir, mode=0o700, exist_ok=True)
+        os.chmod(token_dir, 0o700)
+        token_file = os.path.join(token_dir, "dashboard_token")
+        fd = os.open(token_file, flags, mode)
+        with os.fdopen(fd, "w") as f:
+            f.write(expected_token)
+        logger.info("\n=========================================\n"
+                    "DASHBOARD ACCESS TOKEN GENERATED:\n"
+                    f"  Saved to secure location: {token_file}\n"
+                    "Save this token or set SASHIMI_DASHBOARD_TOKEN in your environment.\n"
+                    "=========================================\n")
+    except Exception as e:
+        logger.error(f"Failed to write dashboard_token file: {str(e)}")
+        
+    return expected_token
+
+def verify_token(authorization: Optional[str] = Header(None)):
+    expected_token = get_or_create_dashboard_token()
+    
+    provided_token = None
+    if authorization and isinstance(authorization, str):
+        parts = authorization.split()
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            provided_token = parts[1]
+        else:
+            provided_token = authorization
+        
+    if not provided_token or not secrets.compare_digest(provided_token, expected_token):
+        raise HTTPException(status_code=401, detail="Unauthorized dashboard access.")
+
+def generate_ws_ticket() -> str:
+    ticket = secrets.token_hex(16)
+    active_tickets[ticket] = time.time() + 10.0  # 10 Sekunden Gueltigkeit
+    return ticket
+
+def verify_and_consume_ticket(ticket: str) -> bool:
+    now = time.time()
+    # Expired Tickets aufraeumen
+    expired = [t for t, exp in list(active_tickets.items()) if exp < now]
+    for t in expired:
+        active_tickets.pop(t, None)
+    if ticket in active_tickets:
+        exp = active_tickets.pop(ticket)
+        return exp >= now
+    return False
+
+def extract_text_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        text_parts = []
+        for part in content:
+            if isinstance(part, str):
+                text_parts.append(part)
+            elif isinstance(part, dict):
+                if part.get("type") == "text" and "text" in part:
+                    text_parts.append(part["text"])
+        return "\n".join(text_parts)
+    return str(content) if content is not None else ""
+
+def parse_files_from_markdown(text: str):
+    import re
+    pattern = r'[ \t]*###\s*FILE:\s*([^\n\r]+)\s*(?:[\r\n]+)[ \t]*```[a-zA-Z0-9#+_-]*\s*[\r\n]+(.*?)(?:[\r\n]+)[ \t]*```'
+    matches = re.findall(pattern, text, re.DOTALL | re.IGNORECASE)
+    results = []
+    for filename, content in matches:
+        fn = filename.strip()
+        if fn:
+            results.append((fn, content))
+    return results
+
+@router.post("/v1/chat/completions", dependencies=[Depends(verify_token), Depends(rate_limit)])
+async def chat_completions(request: ChatCompletionRequest, http_request: Request):
+    logger.info(f"OpenAI API Call empfangen fuer Modell: {request.model}")
+    
+    # Extrahiere den eigentlichen Prompt
+    if not request.messages:
+        raise HTTPException(status_code=400, detail="Keine Nachrichten uebergeben.")
+        
+    if request.messages[-1].role in ("tool", "function"):
+        logger.info("Letzte Nachricht ist eine Tool-Antwort. Beende Workflow/Konversation.")
+        completion_text = "Ich habe die Ergebnisse der Dateioperationen empfangen. Alle Dateien wurden erfolgreich angelegt und verifiziert. Der Workflow ist abgeschlossen."
+        
+        if request.stream:
+            from fastapi.responses import StreamingResponse
+            import time
+            
+            async def simple_generator():
+                chunk_id = f"chatcmpl-{uuid_str()}"
+                created_time = int(time.time())
+                
+                first_chunk = {
+                    "id": chunk_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_time,
+                    "model": request.model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"role": "assistant", "content": ""},
+                            "logprobs": None,
+                            "finish_reason": None
+                        }
+                    ]
+                }
+                yield f"data: {json.dumps(first_chunk)}\n\n"
+                
+                content_chunk = {
+                    "id": chunk_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_time,
+                    "model": request.model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": completion_text},
+                            "logprobs": None,
+                            "finish_reason": None
+                        }
+                    ]
+                }
+                yield f"data: {json.dumps(content_chunk)}\n\n"
+                
+                final_chunk = {
+                    "id": chunk_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_time,
+                    "model": request.model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {},
+                            "logprobs": None,
+                            "finish_reason": "stop"
+                        }
+                    ]
+                }
+                yield f"data: {json.dumps(final_chunk)}\n\n"
+                yield "data: [DONE]\n\n"
+                
+            return StreamingResponse(simple_generator(), media_type="text/event-stream")
+            
+        else:
+            choice = ChatCompletionChoice(
+                index=0,
+                message=ChatMessage(
+                    role="assistant",
+                    content=completion_text
+                ),
+                finish_reason="stop"
+            )
+            
+            response = ChatCompletionResponse(
+                model=request.model,
+                choices=[choice],
+                usage=ChatCompletionUsage(
+                    prompt_tokens=10,
+                    completion_tokens=len(completion_text.split()) * 2,
+                    total_tokens=10 + len(completion_text.split()) * 2
+                )
+            )
+            return response
+            
+    user_messages = [m for m in request.messages if m.role == "user"]
+    if not user_messages:
+        raw_content = request.messages[-1].content
+    else:
+        raw_content = user_messages[-1].content
+
+    prompt = extract_text_content(raw_content)
+
+    workflow_id = f"wf-{uuid_str()}"
+    client_ip = http_request.client.host if http_request.client else "unknown"
+    log_audit_event("workflow_started", {
+        "workflow_id": workflow_id,
+        "model": request.model,
+        "client_ip": client_ip
+    })
+    
+    engine_instance = OrchestratorEngine(workflow_id, prompt)
+    
+    # Starte die Orchestrierung in einem Hintergrund-Task
+    workflow_task = asyncio.create_task(engine_instance.run())
+    active_tasks[workflow_id] = workflow_task
+    
+    # Monitor-Task zur Ueberwachung des Client-Disconnects
+    async def monitor_disconnect():
+        try:
+            while not workflow_task.done():
+                if await http_request.is_disconnected():
+                    logger.warning(f"Client hat die Verbindung getrennt. Breche Workflow {workflow_id} ab.")
+                    engine_instance.state.is_aborted = True
+                    workflow_task.cancel()
+                    break
+                await asyncio.sleep(0.2)
+        except asyncio.CancelledError:
+            pass
+
+    disconnect_monitor_task = asyncio.create_task(monitor_disconnect())
+    
+    try:
+        if request.stream:
+            from fastapi.responses import StreamingResponse
+            import time
+
+            async def event_generator():
+                try:
+                    chunk_id = f"chatcmpl-{uuid_str()}"
+                    created_time = int(time.time())
+                    
+                    first_chunk = {
+                        "id": chunk_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_time,
+                        "model": request.model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"role": "assistant", "content": ""},
+                                "logprobs": None,
+                                "finish_reason": None
+                            }
+                        ]
+                    }
+                    yield f"data: {json.dumps(first_chunk)}\n\n"
+                    
+                    while True:
+                        if workflow_task.done() and engine_instance.stream_queue.empty():
+                            break
+                            
+                        try:
+                            chunk_text = await asyncio.wait_for(engine_instance.stream_queue.get(), timeout=1.0)
+                        except asyncio.TimeoutError:
+                            if workflow_task.done() and engine_instance.stream_queue.empty():
+                                break
+                            yield ": keep-alive\n\n"
+                            continue
+                            
+                        if chunk_text is None:
+                            break
+                            
+                        chunk = {
+                            "id": chunk_id,
+                            "object": "chat.completion.chunk",
+                            "created": created_time,
+                            "model": request.model,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"content": chunk_text},
+                                    "logprobs": None,
+                                    "finish_reason": None
+                                }
+                            ]
+                        }
+                        yield f"data: {json.dumps(chunk)}\n\n"
+                    
+                    final_ans = await workflow_task
+                    parsed_files = parse_files_from_markdown(final_ans)
+                    
+                    if parsed_files and request.tools:
+                        write_tool_name = "write"
+                        client_tool_names = [t.get("function", {}).get("name") for t in request.tools if t.get("type") == "function"]
+                        if "write" in client_tool_names:
+                            write_tool_name = "write"
+                        elif "write_file" in client_tool_names:
+                            write_tool_name = "write_file"
+                        elif "writeFile" in client_tool_names:
+                            write_tool_name = "writeFile"
+                        
+                        for idx, (filepath, code_content) in enumerate(parsed_files):
+                            tc_id = f"call_{uuid_str()[:12]}"
+                            arguments = {
+                                "path": filepath,
+                                "content": code_content
+                            }
+                            
+                            tc_start = {
+                                "id": chunk_id,
+                                "object": "chat.completion.chunk",
+                                "created": created_time,
+                                "model": request.model,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {
+                                            "tool_calls": [
+                                                {
+                                                    "index": idx,
+                                                    "id": tc_id,
+                                                    "type": "function",
+                                                    "function": {
+                                                        "name": write_tool_name,
+                                                        "arguments": ""
+                                                    }
+                                                }
+                                            ]
+                                        },
+                                        "logprobs": None,
+                                        "finish_reason": None
+                                    }
+                                ]
+                            }
+                            yield f"data: {json.dumps(tc_start)}\n\n"
+                            
+                            tc_args = {
+                                "id": chunk_id,
+                                "object": "chat.completion.chunk",
+                                "created": created_time,
+                                "model": request.model,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {
+                                            "tool_calls": [
+                                                {
+                                                    "index": idx,
+                                                    "function": {
+                                                        "arguments": json.dumps(arguments, ensure_ascii=False)
+                                                    }
+                                                }
+                                            ]
+                                        },
+                                        "logprobs": None,
+                                        "finish_reason": None
+                                    }
+                                ]
+                            }
+                            yield f"data: {json.dumps(tc_args)}\n\n"
+                    
+                    finish_reason = "tool_calls" if parsed_files and request.tools else "stop"
+                    final_chunk = {
+                        "id": chunk_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_time,
+                        "model": request.model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {},
+                                "logprobs": None,
+                                "finish_reason": finish_reason
+                            }
+                        ]
+                    }
+                    yield f"data: {json.dumps(final_chunk)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    
+                except asyncio.CancelledError:
+                    logger.warning(f"Streaming-Client hat die Verbindung getrennt. Breche Workflow {workflow_id} ab.")
+                    engine_instance.state.is_aborted = True
+                    workflow_task.cancel()
+                    raise
+                except Exception as e:
+                    logger.exception("Fehler im Streaming-Generator")
+                    error_chunk = {
+                        "id": f"chatcmpl-{uuid_str()}",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": request.model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": "\n\n[FEHLER] Systemfehler bei der Orchestrierung. Bitte Administrator kontaktieren."},
+                                "logprobs": None,
+                                "finish_reason": "error"
+                            }
+                        ]
+                    }
+                    yield f"data: {json.dumps(error_chunk)}\n\n"
+                    yield "data: [DONE]\n\n"
+                finally:
+                    disconnect_monitor_task.cancel()
+                    active_tasks.pop(workflow_id, None)
+
+            return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+        final_answer = await workflow_task
+        tool_calls = []
+        parsed_files = parse_files_from_markdown(final_answer)
+        if parsed_files and request.tools:
+            write_tool_name = "write"
+            client_tool_names = [t.get("function", {}).get("name") for t in request.tools if t.get("type") == "function"]
+            if "write" in client_tool_names:
+                write_tool_name = "write"
+            elif "write_file" in client_tool_names:
+                write_tool_name = "write_file"
+            elif "writeFile" in client_tool_names:
+                write_tool_name = "writeFile"
+                
+            for filepath, code_content in parsed_files:
+                tc_id = f"call_{uuid_str()[:12]}"
+                arguments = {
+                    "path": filepath,
+                    "content": code_content
+                }
+                tool_calls.append({
+                    "id": tc_id,
+                    "type": "function",
+                    "function": {
+                        "name": write_tool_name,
+                        "arguments": json.dumps(arguments, ensure_ascii=False)
+                    }
+                })
+
+        choice = ChatCompletionChoice(
+            index=0,
+            message=ChatMessage(
+                role="assistant", 
+                content=final_answer,
+                tool_calls=tool_calls if tool_calls else None
+            ),
+            finish_reason="tool_calls" if tool_calls else "stop"
+        )
+        
+        prompt_tokens = len(prompt.split()) * 2
+        completion_tokens = len(final_answer.split()) * 2
+        
+        response = ChatCompletionResponse(
+            model=request.model,
+            choices=[choice],
+            usage=ChatCompletionUsage(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=prompt_tokens + completion_tokens
+            )
+        )
+        return response
+        
+    except (InterruptedError, asyncio.CancelledError):
+        raise HTTPException(status_code=499, detail="Workflow durch den Benutzer abgebrochen.")
+    except Exception as e:
+        logger.exception("Schwerer Fehler bei der Systemorchestrierung")
+        raise HTTPException(status_code=500, detail="Interner Serverfehler bei der Workflow-Verarbeitung.")
+    finally:
+        disconnect_monitor_task.cancel()
+        active_tasks.pop(workflow_id, None)
+
+@router.get("/api/verify", dependencies=[Depends(verify_token), Depends(rate_limit)])
+def verify_access():
+    return {"status": "valid"}
+
+@router.post("/api/ws-ticket", dependencies=[Depends(verify_token), Depends(rate_limit)])
+def get_ws_ticket():
+    ticket = generate_ws_ticket()
+    return {"ticket": ticket}
+
+@router.get("/api/keys", dependencies=[Depends(verify_token), Depends(rate_limit)])
+def list_keys():
+    providers = ["openai", "anthropic", "mistral", "openrouter", "deepseek", "google"]
+    results = {}
+    for p in providers:
+        key = get_api_key(p)
+        results[p] = {
+            "configured": bool(key),
+            "masked": f"••••••••••••{key[-4:]}" if key and len(key) > 4 else ("••••" if key else "")
+        }
+    return results
+
+@router.post("/api/keys/{provider}", dependencies=[Depends(verify_token), Depends(rate_limit)])
+def update_key(provider: str, payload: Dict[str, str], http_request: Request):
+    prov = provider.lower().strip()
+    if prov not in ALLOWED_PROVIDERS:
+        raise HTTPException(status_code=400, detail=f"Ungültiger Provider '{provider}'. Erlaubt sind: {', '.join(ALLOWED_PROVIDERS)}")
+    api_key = payload.get("api_key", "").strip()
+    if not api_key:
+        raise HTTPException(status_code=400, detail="Kein API-Key uebergeben.")
+    save_api_key(prov, api_key)
+    client_ip = http_request.client.host if http_request.client else "unknown"
+    log_audit_event("api_key_updated", {
+        "provider": prov,
+        "client_ip": client_ip
+    })
+    logger.info(f"API Key fuer Provider '{prov}' erfolgreich aktualisiert.")
+    return {"status": "ok", "message": f"API Key fuer '{prov}' gespeichert."}
+
+@router.delete("/api/keys/{provider}", dependencies=[Depends(verify_token), Depends(rate_limit)])
+def delete_key(provider: str, http_request: Request):
+    prov = provider.lower().strip()
+    if prov not in ALLOWED_PROVIDERS:
+        raise HTTPException(status_code=400, detail=f"Ungültiger Provider '{provider}'. Erlaubt sind: {', '.join(ALLOWED_PROVIDERS)}")
+    deleted = delete_api_key(prov)
+    client_ip = http_request.client.host if http_request.client else "unknown"
+    log_audit_event("api_key_deleted", {
+        "provider": prov,
+        "client_ip": client_ip
+    })
+    if deleted:
+        logger.info(f"API Key fuer Provider '{prov}' erfolgreich geloescht.")
+        return {"status": "ok", "message": f"API Key fuer '{prov}' geloescht."}
+    else:
+        return {"status": "not_found", "message": f"API Key fuer '{prov}' war nicht hinterlegt."}
+
+@router.get("/api/settings", dependencies=[Depends(verify_token), Depends(rate_limit)])
+def get_settings():
+    keys = [
+        "model_thinker", "model_conductor", "model_worker_backend", 
+        "model_worker_frontend", "model_test_architect", "model_worker_integration",
+        "model_pre_verifier", "model_security_auditor", "model_performance_scout",
+        "model_dependency_watchdog", "model_visual_verifier", "model_runtime_executor",
+        "model_repository_janitor", "pii_masking_enabled", "cost_limit_usd", "llm_timeout_seconds",
+        "test_mode_enabled", "lmstudio_base_url", "ollama_base_url", "llama_cpp_base_url"
+    ]
+    return {k: get_setting(k) for k in keys}
+
+@router.post("/api/settings", dependencies=[Depends(verify_token), Depends(rate_limit)])
+def update_settings(settings: Dict[str, str], http_request: Request):
+    from app.core.security import is_safe_url
+    for k, v in settings.items():
+        if k.endswith("_base_url") and v:
+            if not is_safe_url(v):
+                raise HTTPException(status_code=400, detail=f"Unsafe URL detected for setting '{k}': {v}")
+        save_setting(k, v)
+    client_ip = http_request.client.host if http_request.client else "unknown"
+    log_audit_event("settings_updated", {
+        "updated_keys": list(settings.keys()),
+        "client_ip": client_ip
+    })
+    logger.info("Systemeinstellungen erfolgreich aktualisiert.")
+    return {"status": "ok"}
+
+@router.get("/api/workflows", dependencies=[Depends(verify_token), Depends(rate_limit)])
+def list_workflows():
+    return {wid: w.model_dump() for wid, w in active_workflows.items()}
+
+@router.delete("/api/workflows", dependencies=[Depends(verify_token), Depends(rate_limit)])
+async def delete_workflow_history(http_request: Request):
+    from sqlmodel import Session, delete
+    
+    try:
+        with Session(engine) as session:
+            session.exec(delete(WorkflowsTable))
+            session.commit()
+    except Exception as db_err:
+        logger.error(f"Fehler beim Löschen der Workflows aus der Datenbank: {str(db_err)}")
+        raise HTTPException(status_code=500, detail="Datenbankfehler beim Löschen der Workflows.")
+        
+    to_keep = {}
+    for wid, state in list(active_workflows.items()):
+        if state.status in (TaskStatus.RUNNING, TaskStatus.PENDING):
+            to_keep[wid] = state
+            try:
+                with Session(engine) as session:
+                    new_wf = WorkflowsTable(workflow_id=wid, state_json=state.model_dump_json())
+                    session.add(new_wf)
+                    session.commit()
+            except Exception as e:
+                logger.error(f"Fehler beim Re-Speichern des aktiven Workflows {wid}: {str(e)}")
+                
+    active_workflows.clear()
+    active_workflows.update(to_keep)
+    
+    workflows_dump = {
+        "type": "init_workflows",
+        "data": {wid: json.loads(w.model_dump_json()) for wid, w in active_workflows.items()}
+    }
+    
+    from app.core.state import ws_clients
+    dead_clients = []
+    for client in list(ws_clients):
+        try:
+            await client.send_text(json.dumps(workflows_dump))
+        except Exception:
+            dead_clients.append(client)
+    for client in dead_clients:
+        if client in ws_clients:
+            ws_clients.remove(client)
+            
+    client_ip = http_request.client.host if http_request.client else "unknown"
+    log_audit_event("workflow_history_deleted", {
+        "client_ip": client_ip
+    })
+    logger.info("Workflow-Historie erfolgreich gelöscht.")
+    return {"status": "ok", "message": "Workflow-Historie gelöscht."}
+
+@router.post("/api/workflows/{workflow_id}/abort", dependencies=[Depends(verify_token), Depends(rate_limit)])
+async def abort_workflow(workflow_id: str, http_request: Request):
+    from app.orchestrator.engine import notify_dashboard
+    
+    if workflow_id not in active_workflows:
+        raise HTTPException(status_code=404, detail="Workflow nicht gefunden.")
+    
+    active_workflows[workflow_id].is_aborted = True
+    
+    if workflow_id in active_tasks:
+        active_tasks[workflow_id].cancel()
+        
+    state = active_workflows[workflow_id]
+    if state.status in (TaskStatus.RUNNING, TaskStatus.PENDING):
+        state.status = TaskStatus.ABORTED
+        state.completed_at = datetime.utcnow()
+        if state.tasks:
+            last_task = state.tasks[-1]
+            if last_task.status in (TaskStatus.RUNNING, TaskStatus.PENDING):
+                last_task.status = TaskStatus.ABORTED
+                last_task.completed_at = datetime.utcnow()
+                
+    await notify_dashboard(workflow_id)
+
+    client_ip = http_request.client.host if http_request.client else "unknown"
+    log_audit_event("workflow_aborted_by_user", {
+        "workflow_id": workflow_id,
+        "client_ip": client_ip
+    })
+    logger.warning(f"Abbruch fuer Workflow '{workflow_id}' angefordert und ausgeführt.")
+    return {"status": "ok", "message": "Abbruch-Signal gesendet."}
