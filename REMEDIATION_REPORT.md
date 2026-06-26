@@ -3,7 +3,7 @@
 ### 0. Loop-Protokoll & Executive Summary
 
 - **Loop-Status:** ERFOLGREICH BEHOBEN (Target State reached)
-- **Durchlaufene Iterationen:** 5 / 5
+- **Durchlaufene Iterationen:** 6 / 6
 - **Finale Gesamtnote:** 10/10
 - **Verbleibende offene Punkte:** [Kritisch: 0, Warnungen: 0, Optimierungen: 0]
 
@@ -67,6 +67,15 @@
     - `tests/test_security.py`: `test_anonymizer_capacity_limit` und `test_ssrf_url_validation` zur Testabdeckung der Härtungen hinzugefügt.
   - **Qualitäts-Gate:** Gate bestanden. Alle Unit- und Regressionstests erfolgreich abgeschlossen (`python tests/run_tests.py` -> All tests passed).
 
+- **Iteration 6 (Dependency Update):**
+  - **Zustands-Analyse:** 2 [WARNUNG] gefunden (pip-audit Scan-Fehler in CI/CD).
+    - **F-015 (WARNUNG):** Veraltete/verwundbare Abhängigkeiten in `requirements.txt` (`bleach==6.1.0` und `starlette==0.36.3`).
+  - **Remediation:**
+    - `requirements.in`: Aktualisierung der `bleach` Versionseinschränkung auf `>=6.4.0`.
+    - `requirements.txt`: Upgrade aller Abhängigkeiten mittels `pip-compile --upgrade`, wodurch `bleach` auf `6.4.0` und `starlette` auf `1.3.1` (sowie FastAPI auf `0.138.1`) angehoben wurden.
+    - Durchführung von lokalen `pip-audit` Scans (0 Sicherheitslücken gefunden) und Regressionstests (alle bestanden).
+  - **Qualitäts-Gate:** Gate bestanden. Alle Unit- und Regressionstests erfolgreich abgeschlossen (`python tests/run_tests.py` -> All tests passed).
+
 ---
 
 ### 2. Finale Sicherheits- & Compliance-Analyse
@@ -78,6 +87,10 @@
 #### A02:2025 – Cryptographic Failures (CSPRNG)
 - **Status:** **[Guter Standard]**
 - **Detail:** Tokens werden kryptographisch sicher mit `secrets.token_hex(16)` erzeugt. Die Verschlüsselung von Keys in der SQLite-Datenbank verwendet `cryptography.fernet.Fernet` (AES-128 in CBC Mode mit HMAC-SHA256). Der KDF PBKDF2HMAC verwendet 600.000 Iterationen mit einem obligatorischen `SASHIMI_ENCRYPTION_SALT`.
+
+#### A03:2025 – Software and Data Integrity Failures / Supply Chain (SCA)
+- **Status:** **[Guter Standard]**
+- **Detail:** Abhängigkeiten werden durch `requirements.txt` fest deklariert (Pinned Dependencies). In Iteration 6 wurden bekannte Sicherheitslücken in `bleach` (GHSA-gj48-438w-jh9v, GHSA-8rfp-98v4-mmr6) und `starlette` (PYSEC-2026-161, CVE-2024-47874, CVE-2025-54121, etc.) behoben, indem `pip-compile --upgrade` ausgeführt und die Integrität durch einen automatisierten `pip-audit` Scan verifiziert wurde.
 
 #### A04:2025 – Insecure Design / Compliance (DSGVO, CRA, EU AI Act)
 - **Status:** **[Guter Standard]**
@@ -316,6 +329,16 @@ except Exception:
     "description": "A monolithic FastAPI entrypoint handling all REST routes, WebSocket connections, rate limit definitions, and state stores makes maintenance difficult and violates SOLID principles.",
     "status": "resolved",
     "remediation": "Refactored the application logic into clean components (`app/adapters/inbound/rest.py`, `app/adapters/inbound/websocket.py`, `app/core/state.py`, `app/middleware/rate_limiter.py`) and re-exported backwards-compatible objects in `app/main.py`."
+  },
+  {
+    "id": "F-015",
+    "title": "Vulnerable dependencies in requirements.txt",
+    "severity": "WARNUNG",
+    "cvss": 7.5,
+    "cwe": "CWE-1104: Use of Vulnerable Third-Party Components",
+    "description": "Known security vulnerabilities in `bleach==6.1.0` and `starlette==0.36.3` were identified in the Python Dependency Scan (pip-audit). `bleach` was vulnerable to XSS and path traversal/HTML injection issues, while `starlette` was vulnerable to potential denial-of-service (DoS) and authentication bypasses.",
+    "status": "resolved",
+    "remediation": "Updated minimum version constraint for `bleach` in `requirements.in` and rebuilt `requirements.txt` using `pip-compile --upgrade`. This upgraded `bleach` to `6.4.0` and `starlette` to `1.3.1` (via FastAPI `0.138.1`), which eliminates all listed CVEs."
   }
 ]
 ```

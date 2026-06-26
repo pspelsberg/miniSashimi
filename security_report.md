@@ -1,7 +1,7 @@
 # Security Review & Fix Report
 
 - **Status:** Erfolgreich bereinigt
-- **Iterationen:** 5 von 5
+- **Iterationen:** 6 von 6
 
 ## Historie der Iterationen
 
@@ -10,6 +10,7 @@
 * **Iteration 3**: 0 Befunde gefunden (0 Kritisch, 0 Warnung) -> Qualitäts-Gate bestanden.
 * **Iteration 4**: 6 Befunde gefunden (0 Kritisch, 4 Warnung, 2 Optimierung) -> 6 behoben. (F-006: Validation Handler Leak, F-007: Streaming exception leak, F-008: XFF IP-Spoofing, F-009: Unenforced Cost Limit, F-010: WebSocket Client Registry Leak, F-011: Cleartext Token Cache Storage)
 * **Iteration 5**: 3 Befunde gefunden (0 Kritisch, 1 Warnung, 2 Optimierung) -> 3 behoben. (F-012: SSRF via base URLs, F-013: Anonymizer Cache Limit, F-014: Monolithic main.py)
+* **Iteration 6**: 2 Befunde gefunden (0 Kritisch, 2 Warnung) -> 2 behoben. (F-015: Vulnerable dependencies in requirements.txt - bleach and starlette)
 
 ## Details der Behebungen (Fixes)
 
@@ -29,6 +30,7 @@
 | [app/core/security.py](file:///var/home/peppi/coding/miniSashimi/app/core/security.py) & [app/core/database.py](file:///var/home/peppi/coding/miniSashimi/app/core/database.py) | - | - | Isolation von DB-Dateien und Keys/Salts basierend auf `SASHIMI_ENV` für getrennte Umgebungen (Dev/Test-Agenten-Isolation). |
 | [app/main.py](file:///var/home/peppi/coding/miniSashimi/app/main.py) | - | [SOLID] | Vollständige Aufspaltung der main.py in Router [rest.py](file:///var/home/peppi/coding/miniSashimi/app/adapters/inbound/rest.py) und [websocket.py](file:///var/home/peppi/coding/miniSashimi/app/adapters/inbound/websocket.py), Bündelung der Middlewares, Re-Export für Test-Kompatibilität. |
 | [tests/test_security.py](file:///var/home/peppi/coding/miniSashimi/tests/test_security.py) | 105-138 | [CWE-400] | Hinzufügen von `test_anonymizer_capacity_limit` und `test_ssrf_url_validation` zur Validierung der neuen Schutzmechanismen. |
+| [requirements.txt](file:///home/peppi/coding/miniSashimi/requirements.txt) | - | [CWE-1104] | Upgrade von bleach auf 6.4.0 und starlette auf 1.3.1 via pip-compile --upgrade zur Behebung bekannter Sicherheitslücken (F-015). |
 
 ## Verbliebene Risiken & Hinweise
 * **Ignorierte Meldungen (Low/Info/Optimierung):**
