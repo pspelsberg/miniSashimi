@@ -45,9 +45,9 @@ function App() {
   const [wsConnected, setWsConnected] = useState(false);
   
   // Authentication State
-  const [token, setToken] = useState(localStorage.getItem('sashimi_token') || '');
+  const [csrfToken, setCsrfToken] = useState('');
   const [tokenValid, setTokenValid] = useState(false);
-  const [showTokenModal, setShowTokenModal] = useState(!localStorage.getItem('sashimi_token'));
+  const [showTokenModal, setShowTokenModal] = useState(true);
   const [tokenInput, setTokenInput] = useState('');
   const [authError, setAuthError] = useState('');
 
@@ -90,7 +90,9 @@ function App() {
     test_mode_enabled: 'false',
     lmstudio_base_url: '',
     ollama_base_url: '',
-    llama_cpp_base_url: ''
+    llama_cpp_base_url: '',
+    token_limit: '100000',
+    workflow_timeout_seconds: '300.0'
   });
 
   // Saved Settings State (for tracking server-side confirmed settings)
@@ -114,7 +116,9 @@ function App() {
     test_mode_enabled: 'false',
     lmstudio_base_url: '',
     ollama_base_url: '',
-    llama_cpp_base_url: ''
+    llama_cpp_base_url: '',
+    token_limit: '100000',
+    workflow_timeout_seconds: '300.0'
   });
 
   const wsRef = useRef(null);
@@ -131,12 +135,28 @@ function App() {
     }
   }, [logs, consoleExpanded]);
 
-  // Auto-verify token on mount or token changes
+  // Verify session on mount
   useEffect(() => {
-    if (token) {
-      verifySavedToken(token);
-    }
-  }, [token]);
+    const verifySession = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/verify`, {
+          credentials: 'include'
+        });
+        if (res.ok) {
+          const data = await res.json();
+          setCsrfToken(data.csrf_token);
+          setTokenValid(true);
+          setShowTokenModal(false);
+        } else {
+          setShowTokenModal(true);
+        }
+      } catch (e) {
+        console.error("Session verification failed:", e);
+        setShowTokenModal(true);
+      }
+    };
+    verifySession();
+  }, []);
 
   // Main Effect when token becomes valid
   useEffect(() => {
@@ -151,26 +171,8 @@ function App() {
     };
   }, [tokenValid]);
 
-  const verifySavedToken = async (savedToken) => {
-    try {
-      const res = await fetch(`${API_BASE}/api/verify`, {
-        headers: { 'Authorization': `Bearer ${savedToken}` }
-      });
-      if (res.ok) {
-        setTokenValid(true);
-        setShowTokenModal(false);
-      } else {
-        handleAuthError();
-      }
-    } catch (e) {
-      console.error("Token verification failed:", e);
-      setAuthError("Verbindung zum Server fehlgeschlagen.");
-    }
-  };
-
   const handleAuthError = () => {
-    localStorage.removeItem('sashimi_token');
-    setToken('');
+    setCsrfToken('');
     setTokenValid(false);
     setShowTokenModal(true);
     setAuthError("Sitzung abgelaufen oder ungültiger Token.");
@@ -181,12 +183,15 @@ function App() {
     if (!tokenInput.trim()) return;
 
     try {
-      const res = await fetch(`${API_BASE}/api/verify`, {
-        headers: { 'Authorization': `Bearer ${tokenInput.trim()}` }
+      const res = await fetch(`${API_BASE}/api/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: tokenInput.trim() }),
+        credentials: 'include'
       });
       if (res.ok) {
-        localStorage.setItem('sashimi_token', tokenInput.trim());
-        setToken(tokenInput.trim());
+        const data = await res.json();
+        setCsrfToken(data.csrf_token);
         setTokenValid(true);
         setShowTokenModal(false);
         setAuthError('');
@@ -201,11 +206,17 @@ function App() {
   const authedFetch = async (url, options = {}) => {
     const headers = {
       ...options.headers,
-      'Authorization': `Bearer ${token}`,
       'Content-Type': 'application/json'
     };
-    const res = await fetch(url, { ...options, headers });
-    if (res.status === 401) {
+    if (csrfToken) {
+      headers['X-CSRF-Token'] = csrfToken;
+    }
+    const res = await fetch(url, { 
+      ...options, 
+      headers,
+      credentials: 'include'
+    });
+    if (res.status === 401 || res.status === 403) {
       handleAuthError();
       throw new Error("Unauthorized");
     }
@@ -257,8 +268,7 @@ function App() {
         setWsConnected(false);
         console.log("WebSocket getrennt. Reconnect in 3s...");
         setTimeout(() => {
-          // Reconnect only if still valid
-          if (localStorage.getItem('sashimi_token')) {
+          if (tokenValid) {
             connectWebSocket();
           }
         }, 3000);
@@ -267,7 +277,7 @@ function App() {
       console.error("Fehler beim Herstellen der WebSocket-Verbindung:", e);
       setWsConnected(false);
       setTimeout(() => {
-        if (localStorage.getItem('sashimi_token')) {
+        if (tokenValid) {
           connectWebSocket();
         }
       }, 3000);
@@ -701,6 +711,22 @@ function App() {
                     type="text" 
                     value={settings.llm_timeout_seconds}
                     onChange={(e) => setSettings(prev => ({ ...prev, llm_timeout_seconds: e.target.value }))}
+                  />
+                </div>
+                <div className="key-input-wrapper">
+                  <label>Gesamt-Tokenlimit pro Workflow</label>
+                  <input 
+                    type="text" 
+                    value={settings.token_limit || ''}
+                    onChange={(e) => setSettings(prev => ({ ...prev, token_limit: e.target.value }))}
+                  />
+                </div>
+                <div className="key-input-wrapper">
+                  <label>Gesamt-Workflow Timeout (Sekunden)</label>
+                  <input 
+                    type="text" 
+                    value={settings.workflow_timeout_seconds || ''}
+                    onChange={(e) => setSettings(prev => ({ ...prev, workflow_timeout_seconds: e.target.value }))}
                   />
                 </div>
                 <div className="key-input-wrapper">

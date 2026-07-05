@@ -198,7 +198,7 @@ def decrypt_key(encrypted_text: str) -> str:
 import json
 import hmac
 import hashlib
-from datetime import datetime
+from datetime import datetime, timezone
 
 AUDIT_DIR = os.getenv("SASHIMI_AUDIT_DIR", os.path.expanduser("~/.minisashimi"))
 
@@ -209,7 +209,7 @@ def log_audit_event(event_type: str, details: dict):
     """
     sanitized_details = sanitize_value(details)
     event = {
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "event_type": event_type,
         "details": sanitized_details
     }

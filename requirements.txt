@@ -15,8 +15,7 @@ anyio==4.14.1
     #   httpx
     #   openai
     #   starlette
-bleach==6.4.0
-    # via -r requirements.in
+
 certifi==2026.6.17
     # via
     #   httpcore
@@ -96,7 +95,6 @@ typing-inspection==0.4.2
     #   pydantic-settings
 uvicorn==0.49.0
     # via -r requirements.in
-webencodings==0.5.1
-    # via bleach
+
 websockets==16.0
     # via -r requirements.in

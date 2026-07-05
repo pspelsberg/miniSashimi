@@ -83,8 +83,11 @@ api_rate_limiter = RateLimiter(requests_limit=RATE_LIMIT_REQUESTS, window_second
 async def rate_limit(request: Request):
     # Verwende Authorization-Token oder Client-IP (unter Berücksichtigung von Reverse-Proxys) als Identifikator
     auth = request.headers.get("Authorization", "")
+    cookie_session = request.cookies.get("sashimi_session")
     if auth:
         client_id = auth
+    elif cookie_session:
+        client_id = cookie_session
     else:
         forwarded_for = request.headers.get("X-Forwarded-For")
         trust_proxy = os.getenv("SASHIMI_TRUST_PROXY", "false").lower() == "true"

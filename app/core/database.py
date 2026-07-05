@@ -2,7 +2,7 @@ from sqlmodel import SQLModel, create_engine, Session, select
 from app.domain.models import ApiKeysTable, SettingsTable
 from app.core.security import encrypt_key, decrypt_key
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 env = os.getenv("SASHIMI_ENV", "production").lower()
 if env == "development":
@@ -40,7 +40,9 @@ def init_db():
         "test_mode_enabled": "false",
         "lmstudio_base_url": "http://127.0.0.1:1234/v1",
         "ollama_base_url": "http://127.0.0.1:11434/v1",
-        "llama_cpp_base_url": "http://127.0.0.1:8080/v1"
+        "llama_cpp_base_url": "http://127.0.0.1:8080/v1",
+        "token_limit": "100000",
+        "workflow_timeout_seconds": "300.0"
     }
     
     legacy_defaults = {
@@ -83,7 +85,7 @@ def init_db():
                 )
                 if is_legacy:
                     result.value = v
-                    result.updated_at = datetime.utcnow()
+                    result.updated_at = datetime.now(timezone.utc)
                     session.add(result)
         session.commit()
 
@@ -114,7 +116,7 @@ def save_api_key(provider: str, api_key: str):
         encrypted = encrypt_key(api_key)
         if result:
             result.encrypted_key = encrypted
-            result.updated_at = datetime.utcnow()
+            result.updated_at = datetime.now(timezone.utc)
             session.add(result)
         else:
             new_key = ApiKeysTable(provider=provider, encrypted_key=encrypted)
@@ -145,7 +147,7 @@ def save_setting(key: str, value: str):
         result = session.exec(statement).first()
         if result:
             result.value = value
-            result.updated_at = datetime.utcnow()
+            result.updated_at = datetime.now(timezone.utc)
             session.add(result)
         else:
             new_setting = SettingsTable(key=key, value=value)

@@ -135,3 +135,49 @@ def test_ssrf_url_validation():
     assert is_safe_url("http://169.254.169.254") is False
     assert is_safe_url("gopher://127.0.0.1") is False
     assert is_safe_url("ftp://169.254.169.254") is False
+
+def test_token_limit_enforcement():
+    from app.orchestrator.engine import OrchestratorEngine
+    from app.core.database import save_setting
+    
+    engine = OrchestratorEngine("test-wf-token-limit", "dummy prompt")
+    engine.state.total_tokens = 150000
+    
+    # Set limit to 100,000
+    save_setting("token_limit", "100000")
+    
+    try:
+        engine.check_limits()
+        assert False, "Should have raised ValueError due to token limit exceeded"
+    except ValueError as e:
+        assert "Token-Limit" in str(e)
+
+def test_cookie_auth_and_csrf_validation():
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.adapters.inbound.rest import get_or_create_dashboard_token
+    
+    client = TestClient(app)
+    dashboard_token = get_or_create_dashboard_token()
+    
+    # 1. Test POST /api/login sets cookie sashimi_session
+    res = client.post("/api/login", json={"token": dashboard_token})
+    assert res.status_code == 200
+    assert "csrf_token" in res.json()
+    csrf_token = res.json()["csrf_token"]
+    assert "sashimi_session" in client.cookies
+    
+    # 2. Test GET /api/verify returns csrf_token when cookie is present
+    res = client.get("/api/verify")
+    assert res.status_code == 200
+    assert res.json()["csrf_token"] == csrf_token
+    
+    # 3. Test mutating endpoint with cookie but WITHOUT CSRF header -> must return 403
+    res = client.post("/api/settings", json={"cost_limit_usd": "12.0"})
+    assert res.status_code == 403
+    assert "CSRF" in res.json()["detail"]
+    
+    # 4. Test mutating endpoint with cookie AND correct CSRF header -> must return 200
+    res = client.post("/api/settings", json={"cost_limit_usd": "12.0"}, headers={"X-CSRF-Token": csrf_token})
+    assert res.status_code == 200
+

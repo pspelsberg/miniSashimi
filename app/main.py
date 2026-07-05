@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, Header, Query, Request, WebSocketException
+from contextlib import asynccontextmanager
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -38,11 +39,116 @@ logging.getLogger().addFilter(SecretRedactingFilter())
 logger = logging.getLogger("minisashimi.main")
 
 is_prod = os.getenv("SASHIMI_ENV", "production").lower() == "production"
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    
+    ws_log_handler = WebSocketLogHandler()
+    ws_log_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+    ws_log_handler.addFilter(SecretRedactingFilter())
+    
+    loggers_to_attach = [
+        logging.getLogger(),
+        logging.getLogger("minisashimi"),
+        logging.getLogger("uvicorn"),
+        logging.getLogger("uvicorn.access"),
+        logging.getLogger("uvicorn.error")
+    ]
+    for l in loggers_to_attach:
+        l.addHandler(ws_log_handler)
+        
+    logger.info("Datenbank initialisiert und Standardeinstellungen geladen.")
+    
+    try:
+        from app.domain.models import WorkflowsTable, WorkflowState
+        from sqlmodel import Session, select
+        with Session(engine) as session:
+            statement = select(WorkflowsTable)
+            rows = session.exec(statement).all()
+            for row in rows:
+                try:
+                    state = WorkflowState.model_validate_json(row.state_json)
+                    active_workflows[state.workflow_id] = state
+                except Exception as parse_err:
+                    logger.error(f"Fehler beim Parsen des historischen Workflows {row.workflow_id}: {str(parse_err)}")
+        logger.info(f"{len(active_workflows)} historische/aktive Workflows im Speicher initialisiert.")
+    except Exception as db_err:
+        logger.error(f"Fehler beim Laden historischer Workflows: {str(db_err)}")
+        
+    get_or_create_dashboard_token()
+    api_rate_limiter.start_cleanup()
+    
+    async def ticket_cleanup_loop():
+        while True:
+            try:
+                await asyncio.sleep(60)
+                now = time.time()
+                expired = [t for t, exp in list(active_tickets.items()) if exp < now]
+                for t in expired:
+                    active_tickets.pop(t, None)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in ticket cleanup loop: {str(e)}")
+
+    ticket_task = asyncio.create_task(ticket_cleanup_loop())
+    
+    async def workflow_cleanup_loop():
+        from datetime import datetime, timezone
+        from app.domain.models import TaskStatus
+        while True:
+            try:
+                await asyncio.sleep(300)  # alle 5 Minuten
+                now = datetime.now(timezone.utc)
+                to_remove = []
+                for wid, state in list(active_workflows.items()):
+                    if state.completed_at:
+                        age = (now - state.completed_at).total_seconds()
+                        if age > 3600:  # 1 Stunde
+                            to_remove.append(wid)
+                    else:
+                        if state.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.ABORTED):
+                            state.completed_at = now
+                        else:
+                            age = (now - state.started_at).total_seconds()
+                            if age > 14400:  # 4 Stunden
+                                to_remove.append(wid)
+                for wid in to_remove:
+                    active_workflows.pop(wid, None)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in workflow cleanup loop: {str(e)}")
+
+    workflow_task = asyncio.create_task(workflow_cleanup_loop())
+    
+    async def ws_update_callback(message: Dict[str, Any]):
+        dead_clients = []
+        for client in list(ws_clients):
+            try:
+                await client.send_text(json.dumps(message))
+            except Exception:
+                dead_clients.append(client)
+        for client in dead_clients:
+            if client in ws_clients:
+                ws_clients.remove(client)
+                
+    register_dashboard_callback(ws_update_callback)
+    
+    yield
+    
+    ticket_task.cancel()
+    workflow_task.cancel()
+    for l in loggers_to_attach:
+        l.removeHandler(ws_log_handler)
+
 app = FastAPI(
     title="miniSashimi Multi-Agent Proxy",
     docs_url=None if is_prod else "/docs",
     redoc_url=None if is_prod else "/redoc",
-    openapi_url=None if is_prod else "/openapi.json"
+    openapi_url=None if is_prod else "/openapi.json",
+    lifespan=lifespan
 )
 
 @app.exception_handler(RequestValidationError)
@@ -52,7 +158,8 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         body_str = body.decode("utf-8", errors="ignore")
     except Exception:
         body_str = "<could not read body>"
-    logger.error(f"Validation error: {exc.errors()}")
+    safe_errors = [{"loc": e["loc"], "type": e["type"]} for e in exc.errors()]
+    logger.error(f"Validation error: {safe_errors}")
     from app.core.security import sanitize_value
     logger.error(f"Request body was: {sanitize_value(body_str)}")
     return JSONResponse(
@@ -80,7 +187,7 @@ app.add_middleware(
     allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type"],
+    allow_headers=["Authorization", "Content-Type", "X-CSRF-Token"],
 )
 
 class WebSocketLogHandler(logging.Handler):
@@ -121,109 +228,7 @@ async def broadcast_log_to_ws(message: Dict[str, Any]):
         if client in ws_clients:
             ws_clients.remove(client)
 
-@app.on_event("startup")
-def on_startup():
-    init_db()
-    
-    # Live WebSocket-Log-Handler registrieren
-    ws_log_handler = WebSocketLogHandler()
-    ws_log_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
-    ws_log_handler.addFilter(SecretRedactingFilter())
-    
-    loggers_to_attach = [
-        logging.getLogger(),
-        logging.getLogger("minisashimi"),
-        logging.getLogger("uvicorn"),
-        logging.getLogger("uvicorn.access"),
-        logging.getLogger("uvicorn.error")
-    ]
-    for l in loggers_to_attach:
-        l.addHandler(ws_log_handler)
-        
-    logger.info("Datenbank initialisiert und Standardeinstellungen geladen.")
-    
-    # Lade historische Workflows aus der Datenbank
-    try:
-        from app.domain.models import WorkflowsTable, WorkflowState
-        from sqlmodel import Session, select
-        with Session(engine) as session:
-            statement = select(WorkflowsTable)
-            rows = session.exec(statement).all()
-            for row in rows:
-                try:
-                    state = WorkflowState.model_validate_json(row.state_json)
-                    active_workflows[state.workflow_id] = state
-                except Exception as parse_err:
-                    logger.error(f"Fehler beim Parsen des historischen Workflows {row.workflow_id}: {str(parse_err)}")
-        logger.info(f"{len(active_workflows)} historische/aktive Workflows im Speicher initialisiert.")
-    except Exception as db_err:
-        logger.error(f"Fehler beim Laden historischer Workflows: {str(db_err)}")
-        
-    # Pre-generate or load the dashboard token on startup so the file exists immediately
-    get_or_create_dashboard_token()
-    
-    # Hintergrund-Task für Rate-Limiter Cleanup starten (F-034)
-    api_rate_limiter.start_cleanup()
-    
-    # Hintergrund-Task zur regelmäßigen Ticket-Bereinigung (F-011)
-    async def ticket_cleanup_loop():
-        while True:
-            try:
-                await asyncio.sleep(60)
-                now = time.time()
-                expired = [t for t, exp in list(active_tickets.items()) if exp < now]
-                for t in expired:
-                    active_tickets.pop(t, None)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Error in ticket cleanup loop: {str(e)}")
 
-    asyncio.create_task(ticket_cleanup_loop())
-    
-    # Hintergrund-Task zur regelmäßigen Workflow-Bereinigung (F-002)
-    async def workflow_cleanup_loop():
-        from datetime import datetime
-        from app.domain.models import TaskStatus
-        while True:
-            try:
-                await asyncio.sleep(300)  # alle 5 Minuten
-                now = datetime.utcnow()
-                to_remove = []
-                for wid, state in list(active_workflows.items()):
-                    if state.completed_at:
-                        age = (now - state.completed_at).total_seconds()
-                        if age > 3600:  # 1 Stunde
-                            to_remove.append(wid)
-                    else:
-                        if state.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.ABORTED):
-                            state.completed_at = now
-                        else:
-                            age = (now - state.started_at).total_seconds()
-                            if age > 14400:  # 4 Stunden
-                                to_remove.append(wid)
-                for wid in to_remove:
-                    active_workflows.pop(wid, None)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Error in workflow cleanup loop: {str(e)}")
-
-    asyncio.create_task(workflow_cleanup_loop())
-    
-    # Registriere Callback für Workflow-Updates an WebSockets
-    async def ws_update_callback(message: Dict[str, Any]):
-        dead_clients = []
-        for client in list(ws_clients):
-            try:
-                await client.send_text(json.dumps(message))
-            except Exception:
-                dead_clients.append(client)
-        for client in dead_clients:
-            if client in ws_clients:
-                ws_clients.remove(client)
-                
-    register_dashboard_callback(ws_update_callback)
 
 @app.get("/health", dependencies=[Depends(rate_limit)])
 def health():

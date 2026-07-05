@@ -111,7 +111,7 @@ def test_test_mode_override():
 def test_websocket_serialization_safety():
     import json
     from app.domain.models import WorkflowState, Task, TaskStatus
-    from datetime import datetime
+    from datetime import datetime, timezone
     
     w = WorkflowState(
         workflow_id="test_wf_serial",
@@ -121,13 +121,13 @@ def test_websocket_serialization_safety():
                 title="Subtask",
                 assigned_model="model",
                 status=TaskStatus.COMPLETED,
-                completed_at=datetime.utcnow()
+                completed_at=datetime.now(timezone.utc)
             )
         ],
         is_aborted=False,
         accumulated_cost_usd=0.05,
         status=TaskStatus.RUNNING,
-        started_at=datetime.utcnow()
+        started_at=datetime.now(timezone.utc)
     )
     
     # This must not raise TypeError when serializing via json
@@ -169,9 +169,9 @@ def test_chat_completions_disconnect():
         except (InterruptedError, asyncio.CancelledError) as e:
             # Simuliere das Exception-Handling der Engine
             from app.domain.models import TaskStatus
-            from datetime import datetime
+            from datetime import datetime, timezone
             self.state.status = TaskStatus.ABORTED
-            self.state.completed_at = datetime.utcnow()
+            self.state.completed_at = datetime.now(timezone.utc)
             raise e
             
     with patch("app.main.OrchestratorEngine.run", mock_run), \

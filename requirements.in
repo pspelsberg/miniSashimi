@@ -8,6 +8,4 @@ websockets>=12.0
 sqlmodel>=0.0.22
 aiofiles>=23.2.1
 python-multipart>=0.0.12
-bleach>=6.4.0
 httpx==0.27.2
-

@@ -2,7 +2,7 @@ from typing import List, Dict, Optional, Any, Union
 from enum import Enum
 from pydantic import BaseModel, Field
 from sqlmodel import SQLModel, Field as SQLField
-from datetime import datetime
+from datetime import datetime, timezone
 import uuid
 
 class TaskStatus(str, Enum):
@@ -18,7 +18,7 @@ class Task(BaseModel):
     assigned_model: str
     payload: Dict[str, Any] = Field(default_factory=dict)
     status: TaskStatus = TaskStatus.PENDING
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     completed_at: Optional[datetime] = None
     output: Optional[str] = None
     error: Optional[str] = None
@@ -34,7 +34,7 @@ class WorkflowState(BaseModel):
     is_aborted: bool = False
     accumulated_cost_usd: float = 0.0
     status: TaskStatus = TaskStatus.PENDING
-    started_at: datetime = Field(default_factory=datetime.utcnow)
+    started_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     completed_at: Optional[datetime] = None
     prompt_tokens: int = 0
     completion_tokens: int = 0
@@ -47,20 +47,20 @@ class ApiKeysTable(SQLModel, table=True):
     id: int = SQLField(default=None, primary_key=True)
     provider: str = SQLField(unique=True, index=True)  # openai, anthropic, mistral, openrouter, deepseek, etc.
     encrypted_key: str = SQLField(default="")
-    updated_at: datetime = SQLField(default_factory=datetime.utcnow)
+    updated_at: datetime = SQLField(default_factory=lambda: datetime.now(timezone.utc))
 
 class SettingsTable(SQLModel, table=True):
     __tablename__ = "settings"
     id: int = SQLField(default=None, primary_key=True)
     key: str = SQLField(unique=True, index=True) # model_thinker, model_conductor, cost_limit, pii_masking_enabled, etc.
     value: str = SQLField(default="")
-    updated_at: datetime = SQLField(default_factory=datetime.utcnow)
+    updated_at: datetime = SQLField(default_factory=lambda: datetime.now(timezone.utc))
 
 class WorkflowsTable(SQLModel, table=True):
     __tablename__ = "workflows"
     workflow_id: str = SQLField(primary_key=True, index=True)
     state_json: str = SQLField(default="{}")
-    updated_at: datetime = SQLField(default_factory=datetime.utcnow)
+    updated_at: datetime = SQLField(default_factory=lambda: datetime.now(timezone.utc))
 
 # Pydantic-Modelle für API-Requests/Responses (OpenAI-Kompatibilität)
 class ChatMessage(BaseModel):
@@ -97,7 +97,7 @@ class ChatCompletionUsage(BaseModel):
 class ChatCompletionResponse(BaseModel):
     id: str = Field(default_factory=lambda: f"chatcmpl-{uuid.uuid4().hex[:12]}")
     object: str = "chat.completion"
-    created: int = Field(default_factory=lambda: int(datetime.utcnow().timestamp()))
+    created: int = Field(default_factory=lambda: int(datetime.now(timezone.utc).timestamp()))
     model: str
     choices: List[ChatCompletionChoice]
     usage: ChatCompletionUsage

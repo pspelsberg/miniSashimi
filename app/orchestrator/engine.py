@@ -4,7 +4,7 @@ import logging
 import re
 from typing import List, Dict, Any, Callable, Awaitable, Optional, Literal
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pydantic import BaseModel, model_validator
 
 from app.domain.models import Task, WorkflowState, TaskStatus
@@ -106,7 +106,7 @@ async def notify_dashboard(workflow_id: str):
                 row = session.get(WorkflowsTable, workflow_id)
                 if row:
                     row.state_json = state.model_dump_json()
-                    row.updated_at = datetime.utcnow()
+                    row.updated_at = datetime.now(timezone.utc)
                     session.add(row)
                 else:
                     new_wf = WorkflowsTable(workflow_id=workflow_id, state_json=state.model_dump_json())
@@ -222,7 +222,7 @@ class OrchestratorEngine:
             is_aborted=False,
             accumulated_cost_usd=0.0,
             status=TaskStatus.RUNNING,
-            started_at=datetime.utcnow()
+            started_at=datetime.now(timezone.utc)
         )
         active_workflows[workflow_id] = self.state
 
@@ -259,6 +259,19 @@ class OrchestratorEngine:
                 "limit_usd": limit
             })
             raise ValueError(f"Kostenlimit von ${limit:.4f} ueberschritten. Aktuelle Kosten: ${self.state.accumulated_cost_usd:.4f}")
+
+    def check_limits(self):
+        self.check_cost_limit()
+        
+        token_limit = int(get_setting("token_limit", "100000"))
+        if self.state.total_tokens >= token_limit:
+            self.state.status = TaskStatus.FAILED
+            log_audit_event("workflow_token_limit_exceeded", {
+                "workflow_id": self.workflow_id,
+                "total_tokens": self.state.total_tokens,
+                "limit_tokens": token_limit
+            })
+            raise ValueError(f"Token-Limit von {token_limit:,} ueberschritten. Aktueller Verbrauch: {self.state.total_tokens:,}")
 
     def add_cost(self, usage: Dict[str, int], model: str, task: Optional[Task] = None):
         """Berechnet die ungefähren Kosten basierend auf dem Modell und aggregiert Token."""
@@ -299,10 +312,28 @@ class OrchestratorEngine:
         cost = (usage.get("prompt_tokens", 0) * prompt_rate) + (usage.get("completion_tokens", 0) * completion_rate)
         self.state.accumulated_cost_usd += cost
         
-        # Enforce cost limit directly after adding costs to prevent runaway billing (CWE-400, LLM10:2025)
-        self.check_cost_limit()
+        # Enforce limits directly after adding costs to prevent runaway billing (CWE-400, LLM10:2025)
+        self.check_limits()
 
     async def run(self) -> str:
+        timeout_val = float(get_setting("workflow_timeout_seconds", "300.0"))
+        try:
+            async with asyncio.timeout(timeout_val):
+                return await self._run_internal()
+        except asyncio.TimeoutError:
+            self.state.status = TaskStatus.FAILED
+            self.state.completed_at = datetime.now(timezone.utc)
+            if self.state.tasks:
+                last_task = self.state.tasks[-1]
+                if last_task.status in (TaskStatus.RUNNING, TaskStatus.PENDING):
+                    last_task.status = TaskStatus.FAILED
+                    last_task.error = "Workflow-Timeout ueberschritten."
+                    last_task.completed_at = datetime.now(timezone.utc)
+            self.state.error = "Workflow-Timeout ueberschritten."
+            await notify_dashboard(self.workflow_id)
+            raise ValueError(f"Workflow-Timeout von {timeout_val} Sekunden ueberschritten.")
+
+    async def _run_internal(self) -> str:
         try:
             await notify_dashboard(self.workflow_id)
             
@@ -327,7 +358,7 @@ class OrchestratorEngine:
             self.add_cost(usage, thinker_task.assigned_model, thinker_task)
             thinker_task.output = content
             thinker_task.status = TaskStatus.COMPLETED
-            thinker_task.completed_at = datetime.utcnow()
+            thinker_task.completed_at = datetime.now(timezone.utc)
             await notify_dashboard(self.workflow_id)
             await self.emit_output("🧠 Phase 1: Systemarchitektur & Ablauf-Planung (Thinker)", content)
 
@@ -359,7 +390,7 @@ class OrchestratorEngine:
                 
             conductor_task.output = json.dumps(raw_tasks, indent=2)
             conductor_task.status = TaskStatus.COMPLETED
-            conductor_task.completed_at = datetime.utcnow()
+            conductor_task.completed_at = datetime.now(timezone.utc)
             await notify_dashboard(self.workflow_id)
             await self.emit_output("📋 Phase 1: Tool-Auswahl & Workflow-Konstruktion (Conductor)", f"```json\n{conductor_task.output}\n```")
 
@@ -390,7 +421,7 @@ class OrchestratorEngine:
                 self.add_cost(usage, actual_model, w_task)
                 w_task.output = w_out
                 w_task.status = TaskStatus.COMPLETED
-                w_task.completed_at = datetime.utcnow()
+                w_task.completed_at = datetime.now(timezone.utc)
                 worker_outputs.append(f"### Output von {w_task.title}:\n{w_out}")
                 await notify_dashboard(self.workflow_id)
                 await self.emit_output(f"🛠️ Phase 2: {w_task.title}", w_out)
@@ -412,7 +443,7 @@ class OrchestratorEngine:
             self.add_cost(usage, verifier_task.assigned_model, verifier_task)
             verifier_task.output = v_out
             verifier_task.status = TaskStatus.COMPLETED
-            verifier_task.completed_at = datetime.utcnow()
+            verifier_task.completed_at = datetime.now(timezone.utc)
             await notify_dashboard(self.workflow_id)
             await self.emit_output("🔍 Phase 3: Syntax-Validierung & Vorab-Prüfung (Pre-Verifier)", v_out)
 
@@ -431,7 +462,7 @@ class OrchestratorEngine:
             self.add_cost(usage, security_task.assigned_model, security_task)
             security_task.output = sec_out
             security_task.status = TaskStatus.COMPLETED
-            security_task.completed_at = datetime.utcnow()
+            security_task.completed_at = datetime.now(timezone.utc)
             await notify_dashboard(self.workflow_id)
             await self.emit_output("🛡️ Phase 3: Verifier: Security Auditor", sec_out)
 
@@ -458,10 +489,10 @@ class OrchestratorEngine:
                 
             synthesis_task.output = final_content
             synthesis_task.status = TaskStatus.COMPLETED
-            synthesis_task.completed_at = datetime.utcnow()
+            synthesis_task.completed_at = datetime.now(timezone.utc)
             
             self.state.status = TaskStatus.COMPLETED
-            self.state.completed_at = datetime.utcnow()
+            self.state.completed_at = datetime.now(timezone.utc)
             log_audit_event("workflow_completed", {
                 "workflow_id": self.workflow_id,
                 "cost_usd": self.state.accumulated_cost_usd,
@@ -475,7 +506,7 @@ class OrchestratorEngine:
         except (InterruptedError, asyncio.CancelledError) as e:
             logger.warning(f"Workflow {self.workflow_id} abgebrochen: {str(e)}")
             self.state.status = TaskStatus.ABORTED
-            self.state.completed_at = datetime.utcnow()
+            self.state.completed_at = datetime.now(timezone.utc)
             log_audit_event("workflow_aborted", {
                 "workflow_id": self.workflow_id,
                 "cost_usd": self.state.accumulated_cost_usd
@@ -486,7 +517,7 @@ class OrchestratorEngine:
         except Exception as e:
             logger.error(f"Schwerer Fehler im Workflow {self.workflow_id}: {str(e)}")
             self.state.status = TaskStatus.FAILED
-            self.state.completed_at = datetime.utcnow()
+            self.state.completed_at = datetime.now(timezone.utc)
             log_audit_event("workflow_failed", {
                 "workflow_id": self.workflow_id,
                 "error": str(e),

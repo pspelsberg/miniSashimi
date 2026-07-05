@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Header, Request
+from fastapi import APIRouter, Depends, HTTPException, Header, Request, Response
 from sqlmodel import Session
 from typing import Dict, Any, List, Optional
 import os
@@ -7,7 +7,7 @@ import time
 import json
 import logging
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 
 from app.domain.models import (
     ChatCompletionRequest, ChatCompletionResponse, ChatCompletionChoice, 
@@ -69,19 +69,50 @@ def get_or_create_dashboard_token() -> str:
         
     return expected_token
 
-def verify_token(authorization: Optional[str] = Header(None)):
+class AuthContext:
+    def __init__(self, token: str, csrf_token: Optional[str] = None, auth_method: str = "header"):
+        self.token = token
+        self.csrf_token = csrf_token
+        self.auth_method = auth_method
+
+def verify_token(request: Request, authorization: Optional[str] = Header(None)) -> AuthContext:
     expected_token = get_or_create_dashboard_token()
     
     provided_token = None
-    if authorization and isinstance(authorization, str):
-        parts = authorization.split()
-        if len(parts) == 2 and parts[0].lower() == "bearer":
-            provided_token = parts[1]
-        else:
-            provided_token = authorization
-        
+    csrf_token = None
+    auth_method = "header"
+    
+    cookie_val = request.cookies.get("sashimi_session")
+    if cookie_val:
+        try:
+            decrypted = decrypt_key(cookie_val)
+            if decrypted and ":" in decrypted:
+                parts = decrypted.split(":", 1)
+                provided_token = parts[0]
+                csrf_token = parts[1]
+                auth_method = "cookie"
+        except Exception:
+            pass
+            
+    if not provided_token:
+        if authorization and isinstance(authorization, str):
+            parts = authorization.split()
+            if len(parts) == 2 and parts[0].lower() == "bearer":
+                provided_token = parts[1]
+            else:
+                provided_token = authorization
+            auth_method = "header"
+            
     if not provided_token or not secrets.compare_digest(provided_token, expected_token):
         raise HTTPException(status_code=401, detail="Unauthorized dashboard access.")
+        
+    if auth_method == "cookie" and request.method in ("POST", "PUT", "DELETE"):
+        csrf_header = request.headers.get("X-CSRF-Token")
+        if not csrf_header or not csrf_token or not secrets.compare_digest(csrf_header, csrf_token):
+            raise HTTPException(status_code=403, detail="CSRF token validation failed.")
+            
+    return AuthContext(token=provided_token, csrf_token=csrf_token, auth_method=auth_method)
+
 
 def generate_ws_ticket() -> str:
     ticket = secrets.token_hex(16)
@@ -491,9 +522,35 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
         disconnect_monitor_task.cancel()
         active_tasks.pop(workflow_id, None)
 
-@router.get("/api/verify", dependencies=[Depends(verify_token), Depends(rate_limit)])
-def verify_access():
-    return {"status": "valid"}
+@router.get("/api/verify", dependencies=[Depends(rate_limit)])
+def verify_access(auth: AuthContext = Depends(verify_token)):
+    return {"status": "valid", "csrf_token": auth.csrf_token}
+
+@router.post("/api/login")
+def login(payload: Dict[str, str], response: Response):
+    token = payload.get("token", "").strip()
+    expected_token = get_or_create_dashboard_token()
+    if not token or not secrets.compare_digest(token, expected_token):
+        raise HTTPException(status_code=401, detail="Invalid token")
+    
+    csrf_token = secrets.token_hex(16)
+    cookie_value = encrypt_key(f"{token}:{csrf_token}")
+    
+    response.set_cookie(
+        key="sashimi_session",
+        value=cookie_value,
+        httponly=True,
+        secure=False,
+        samesite="lax",
+        max_age=86400
+    )
+    return {"status": "ok", "csrf_token": csrf_token}
+
+@router.post("/api/logout")
+def logout(response: Response):
+    response.delete_cookie("sashimi_session")
+    return {"status": "ok"}
+
 
 @router.post("/api/ws-ticket", dependencies=[Depends(verify_token), Depends(rate_limit)])
 def get_ws_ticket():
@@ -554,7 +611,8 @@ def get_settings():
         "model_pre_verifier", "model_security_auditor", "model_performance_scout",
         "model_dependency_watchdog", "model_visual_verifier", "model_runtime_executor",
         "model_repository_janitor", "pii_masking_enabled", "cost_limit_usd", "llm_timeout_seconds",
-        "test_mode_enabled", "lmstudio_base_url", "ollama_base_url", "llama_cpp_base_url"
+        "test_mode_enabled", "lmstudio_base_url", "ollama_base_url", "llama_cpp_base_url",
+        "token_limit", "workflow_timeout_seconds"
     ]
     return {k: get_setting(k) for k in keys}
 
@@ -643,12 +701,12 @@ async def abort_workflow(workflow_id: str, http_request: Request):
     state = active_workflows[workflow_id]
     if state.status in (TaskStatus.RUNNING, TaskStatus.PENDING):
         state.status = TaskStatus.ABORTED
-        state.completed_at = datetime.utcnow()
+        state.completed_at = datetime.now(timezone.utc)
         if state.tasks:
             last_task = state.tasks[-1]
             if last_task.status in (TaskStatus.RUNNING, TaskStatus.PENDING):
                 last_task.status = TaskStatus.ABORTED
-                last_task.completed_at = datetime.utcnow()
+                last_task.completed_at = datetime.now(timezone.utc)
                 
     await notify_dashboard(workflow_id)
 
