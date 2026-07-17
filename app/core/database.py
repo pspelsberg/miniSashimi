@@ -1,8 +1,11 @@
+from typing import Optional
+
 from sqlmodel import SQLModel, create_engine, Session, select
-from app.domain.models import ApiKeysTable, SettingsTable
+from app.domain.models import ApiKeysTable, SettingsTable, SessionTable
 from app.core.security import encrypt_key, decrypt_key
 import os
 from datetime import datetime, timezone
+import hashlib
 
 env = os.getenv("SASHIMI_ENV", "production").lower()
 if env == "development":
@@ -18,6 +21,13 @@ engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 def init_db():
     """Initialisiert die Datenbank-Tabellen und Standardeinstellungen."""
     SQLModel.metadata.create_all(engine)
+    
+    # Restriktive Dateirechte setzen (0o600) zur Absicherung lokaler Zugriffe (CWE-276)
+    if os.path.exists(DATABASE_FILE):
+        try:
+            os.chmod(DATABASE_FILE, 0o600)
+        except OSError:
+            pass
     
     # Standardeinstellungen anlegen falls noch nicht vorhanden (SOTA 2026 - Sonnet 4.6, GLM 5.2, Opus 4.8, ChatGPT 5.5)
     default_settings = {
@@ -153,3 +163,54 @@ def save_setting(key: str, value: str):
             new_setting = SettingsTable(key=key, value=value)
             session.add(new_setting)
         session.commit()
+
+
+def _digest(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def create_session(session_id: str, token: str, csrf_token: str, expires_at: datetime) -> None:
+    """Persist a session using hashes only; raw credentials never enter SQLite."""
+    with Session(engine) as session:
+        session.add(SessionTable(
+            session_id=session_id,
+            token_hash=_digest(token),
+            csrf_hash=_digest(csrf_token),
+            expires_at=expires_at,
+        ))
+        session.commit()
+
+
+def get_session(session_id: str) -> Optional[SessionTable]:
+    with Session(engine) as session:
+        result = session.get(SessionTable, session_id)
+        if result is None:
+            return None
+        expires_at = result.expires_at
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at <= datetime.now(timezone.utc):
+            session.delete(result)
+            session.commit()
+            return None
+        return result
+
+
+def delete_session(session_id: str) -> None:
+    with Session(engine) as session:
+        result = session.get(SessionTable, session_id)
+        if result:
+            session.delete(result)
+            session.commit()
+
+
+def delete_expired_sessions() -> int:
+    from sqlmodel import delete
+
+    with Session(engine) as session:
+        statement = delete(SessionTable).where(
+            SessionTable.expires_at <= datetime.now(timezone.utc)
+        )
+        result = session.exec(statement)
+        session.commit()
+        return result.rowcount or 0

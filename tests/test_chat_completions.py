@@ -49,8 +49,13 @@ def test_chat_completion_request_validation():
 
 def test_call_llm_temperature_fallback():
     import asyncio
+    import os
     from unittest.mock import AsyncMock, MagicMock, patch
     from app.adapters.outbound.llm.client import call_llm
+
+    os.environ.setdefault("SASHIMI_ALLOWED_BASE_HOSTS", "")
+    import app.core.database
+    app.core.database.init_db()
     
     mock_response = MagicMock()
     mock_response.choices = [MagicMock()]
@@ -92,8 +97,10 @@ def test_call_llm_temperature_fallback():
 
 def test_test_mode_override():
     from app.orchestrator.engine import OrchestratorEngine
-    from app.core.database import save_setting
-    
+    from app.core.database import save_setting, init_db
+
+    init_db()
+
     engine = OrchestratorEngine("test-workflow-id", "test prompt")
     
     # Normally should return the configured settings
@@ -564,8 +571,13 @@ def test_chat_completions_tool_response_shortcut_streaming():
 
 def test_call_llm_local_models():
     import asyncio
+    import os
     from unittest.mock import AsyncMock, MagicMock, patch
     from app.adapters.outbound.llm.client import call_llm
+    from app.core.database import init_db
+
+    init_db()
+    os.environ.setdefault("SASHIMI_ALLOWED_BASE_HOSTS", "test-ollama-url,test-llama-cpp-url")
 
     mock_response = MagicMock()
     mock_response.choices = [MagicMock()]
@@ -589,7 +601,8 @@ def test_call_llm_local_models():
 
     with patch("app.adapters.outbound.llm.client.get_openai_client", return_value=mock_client) as mock_get_client, \
          patch("app.adapters.outbound.llm.client.get_setting", side_effect=mock_get_setting), \
-         patch("app.adapters.outbound.llm.client.get_api_key", return_value=None):
+         patch("app.adapters.outbound.llm.client.get_api_key", return_value=None), \
+         patch.dict("os.environ", {"SASHIMI_ALLOWED_BASE_HOSTS": "test-ollama-url,test-llama-cpp-url"}):
 
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)

@@ -117,11 +117,19 @@ async def notify_dashboard(workflow_id: str):
 
 def sanitize_llm_output(content: str) -> str:
     """
-    Returns the content directly. Standard rendering in the frontend (React's text nodes)
-    ensures safety by automatically escaping HTML tags, preventing XSS/injection attacks
-    without corrupting programming syntax.
+    Defense-in-depth sanitization for LLM output (F-001 / CWE-79 / LLM05:2025).
+
+    React's text nodes auto-escape HTML, but non-React consumers (CLI, cURL,
+    n8n webhooks) may render output without escaping.  We strip null bytes and
+    other dangerous control characters that could be used for injection or
+    log-forging while preserving programming syntax (brackets, angle-brackets,
+    etc.) so that code blocks remain intact.
     """
-    return content
+    if not content:
+        return content
+    # Remove null bytes (CWE-626) and ASCII control chars except common
+    # whitespace (tab, newline, carriage return).
+    return re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', content)
 
 
 def extract_json(s: str) -> Any:

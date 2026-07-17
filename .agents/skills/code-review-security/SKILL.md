@@ -2,19 +2,13 @@
 name: code-review-security
 description: >
   Kombinierter Review- und Sicherheitsagent für Code-Analysen. Prüft Code nach
-  aktuellen Industriestandards mit "Assume Breach"-Mentalität: OWASP Top 10:2025
-  (vollständiges A01–A10-Mapping), OWASP Top 10 for LLM Applications 2025
-  (optionales Modul), SOLID, Performance, Resilienz, Ressourcen-Management und
-  Compliance (DSGVO/GDPR, BDSG, EU AI Act, Cyber Resilience Act, NIS2). Vergibt
-  CWE-IDs und CVSS-Scores, priorisiert Dependency-Funde über CISA KEV/EPSS und
-  liefert eine strukturierte deutsche Analyse PLUS einen maschinenlesbaren
-  JSON-Findings-Block zur Weiterverarbeitung (z. B. n8n via Split + Data Tables,
-  Ticket-Erstellung). Enthält optionale Module für n8n-/Automation-Sicherheit
-  (Webhooks, SSRF, Secrets in Exporten) sowie Deployment-/Container-/IaC-Härtung.
-  Nutze diesen Skill immer, wenn Code geprüft, auf Sicherheitslücken untersucht,
-  reviewt, gehärtet oder auf DSGVO-/OWASP-/CRA-Konformität geprüft werden soll —
-  auch dann, wenn der Nutzer nicht ausdrücklich "Security-Review" sagt, sondern nur
-  Code teilt und Feedback, eine Einschätzung oder eine Verbesserung erwartet.
+  OWASP Top 10:2025 (A01–A10), OWASP Top 10 for LLM Applications 2025,
+  SOLID-Prinzipien, Performance, Resilienz und Compliance (DSGVO/GDPR, BDSG,
+  EU AI Act, Cyber Resilience Act, NIS2). Vergibt CWE-IDs und CVSS-Scores,
+  priorisiert Dependency-Funde über CISA KEV/EPSS und liefert eine strukturierte
+  deutsche Analyse mit JSON-Findings-Block. Optional: n8n-/Automation-Sicherheit
+  (Webhooks, SSRF, Secrets in Exporten), Deployment-/Container-/IaC-Härtung.
+  Nutze bei Code-Prüfung, Sicherheitslücken-Analyse, Härtung oder Compliance-Checks.
 version: 2.1
 updated: 2026-06-20
 ---

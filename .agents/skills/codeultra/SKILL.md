@@ -1,23 +1,16 @@
 ---
 name: codeultra
 description: >
-  Transformiert einen Implementierungsplan in eine AX-optimierte Enterprise-
-  Architektur ODER reviewt und härtet bestehenden Code — beides "Secure & Compliant
-  by Design" mit "Assume Breach"-Mentalität und speziellem Fokus auf Coding-Agents
-  (Claude Code & Co.). Deckt ab: OWASP Top 10:2025 (vollständiges A01–A10-Mapping),
-  OWASP Top 10 for LLM Applications 2025 (LLM01–LLM10, inkl. Excessive Agency von
-  Coding-Agents), CWE/CVSS/CISA-KEV/EPSS-Priorisierung, hexagonale Architektur,
-  API-First, SOLID, Testbarkeit, Resilienz, Secret-Guardrails (Zero-Leak-Policy,
-  kein Microsoft Entra / Azure Key Vault) sowie Compliance (DSGVO/GDPR, BDSG,
-  EU AI Act inkl. Omnibus-Stand, Cyber Resilience Act, NIS2). Erzeugt als Output
-  entweder ARCHITECTURE.md (Verzeichnisbaum + kommentierte Kontrakte + IaC +
-  Risikomatrix) oder eine strukturierte deutsche Analyse plus einen maschinen-
-  lesbaren JSON-Findings-Block. Nutze diesen Skill immer, wenn ein Implementierungs-
-  plan in eine Architektur überführt, Enterprise-Software entworfen, Code geprüft,
-  reviewt oder gehärtet oder auf DSGVO-/OWASP-/EU-AI-Act-/CRA-Konformität untersucht
-  werden soll — auch dann, wenn der Nutzer nicht ausdrücklich "Architektur" oder
-  "Security-Review" sagt, sondern nur einen Plan oder Code teilt und eine fundierte
-  Einschätzung, Verbesserung oder Härtung erwartet.
+  Transformiert Implementierungspläne in AX-optimierte Enterprise-Architekturen
+  ODER reviewt/härtet bestehenden Code — beides "Secure & Compliant by Design"
+  mit "Assume Breach"-Mentalität und Fokus auf Coding-Agents (Claude Code & Co.).
+  Deckt: OWASP Top 10:2025 (A01–A10), OWASP Top 10 for LLM Applications 2025
+  (LLM01–LLM10), CWE/CVSS/CISA-KEV/EPSS, hexagonale Architektur, API-First,
+  SOLID, Testbarkeit, Resilienz, Secret-Guardrails (Zero-Leak-Policy, keine
+  Microsoft Entra/Azure Key Vault), Compliance (DSGVO/GDPR, BDSG, EU AI Act,
+  Cyber Resilience Act, NIS2). Ausgabe: ARCHITECTURE.md ODER strukturierte Analyse
+  mit JSON-Findings-Block. Nutze bei Architektur-Design, Code-Review, Härtung oder
+  Compliance-Prüfung.
 version: 3.0
 updated: 2026-06-23
 ---

@@ -18,7 +18,22 @@ dist-ssr/
 
 # SQLite Database & Encryption Key
 minisashimi.db
+minisashimi_*.db
 .enc_key
+enc_key
+enc_salt
+dashboard_token
+
+# Environment / Secrets
+.env
+.env.*
+
+# Audit Logs & Key Material
+audit.log
+keys/
+
+# LanceDB Vector Store
+.lancedb/
 
 # OS
 .DS_Store

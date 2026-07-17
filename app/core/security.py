@@ -11,8 +11,12 @@ load_dotenv()
 
 # Masking regex for secrets/API keys (Zero-Leak-Policy)
 SECRET_MASK_REGEX = re.compile(
-    r'\b(?:sk-[a-zA-Z0-9]{32,}|sk-ant-[a-zA-Z0-9-]{40,}|ghp_[a-zA-Z0-9]{36,}|key-[a-zA-Z0-9]{32,})\b',
-    re.IGNORECASE
+    r"(?i)(?:"
+    r"sk-[A-Za-z0-9_-]{16,}|sk-ant-[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9]{20,}|"
+    r"key-[A-Za-z0-9_-]{16,}|AKIA[0-9A-Z]{16}|"
+    r"(?:authorization|x-api-key|api[_-]?key|token|secret|password)\s*[:=]\s*['\"]?"
+    r"[A-Za-z0-9._~+/=-]{12,}"
+    r")"
 )
 
 class SecretRedactingFilter(logging.Filter):
@@ -39,37 +43,127 @@ def sanitize_value(val: Any) -> Any:
     return val
 
 def is_safe_url(url: str) -> bool:
-    """
-    Validiert eine URL, um SSRF-Angriffe (z. B. auf Cloud-Metadaten-IPs) zu verhindern.
-    """
+    """Validate an outbound URL against private-network and metadata SSRF targets."""
     from urllib.parse import urlparse
+    import ipaddress
     import socket
+
     try:
         parsed = urlparse(url)
-        if parsed.scheme not in ("http", "https"):
+        if parsed.scheme not in ("http", "https") or parsed.username or parsed.password:
             return False
         hostname = parsed.hostname
         if not hostname:
             return False
-            
-        # Cloud Metadata IPs blockieren
-        blocked_ips = {"169.254.169.254"}
-        
-        if hostname in blocked_ips:
-            return False
-            
-        # Resolve Hostname to check resolved IPs
+
+        def allowed_ip(raw_ip: str) -> bool:
+            address = ipaddress.ip_address(raw_ip)
+            if str(address) == "169.254.169.254":
+                return False
+            # Loopback is required for explicitly configured local LLM services.
+            if address.is_loopback:
+                return True
+            # Translate IPv4-mapped and NAT64-wrapped IPv6 addresses so that
+            # they are evaluated against the embedded IPv4 range instead of
+            # being reported as link-local / reserved by the IPv6 classifier.
+            if isinstance(address, ipaddress.IPv6Address):
+                packed = address.packed
+                if packed[:12] == b"\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff":
+                    address = ipaddress.IPv4Address(packed[12:])
+                elif packed[:4] == b"\x00\x64\xff\x9b":
+                    address = ipaddress.IPv4Address(int.from_bytes(packed[12:], "big"))
+                elif address.sixtofour is not None:
+                    address = ipaddress.IPv4Address(address.sixtofour[1])
+            return not (
+                address.is_private
+                or address.is_link_local
+                or address.is_reserved
+                or address.is_multicast
+                or address.is_unspecified
+            )
+
         try:
-            ips = socket.getaddrinfo(hostname, None)
-            for ip in ips:
-                ip_addr = ip[4][0]
-                if ip_addr in blocked_ips:
-                    return False
-        except Exception:
-            pass
+            literal = ipaddress.ip_address(hostname)
+        except ValueError:
+            literal = None
+        if literal is not None:
+            return allowed_ip(str(literal))
+
+        # Operators can pre-register placeholder hostnames (e.g. local test
+        # environments) that have no public DNS record. Such entries bypass
+        # the IP address check entirely.
+        if hostname in _extra_hosts():
+            return True
+
+        # Resolve every returned address; DNS-rebinding or local destinations
+        # are caught when at least one address fails the allowlist.
+        try:
+            addresses = socket.getaddrinfo(
+                hostname,
+                parsed.port or (443 if parsed.scheme == "https" else 80),
+                type=socket.SOCK_STREAM,
+            )
+        except socket.gaierror:
+            return False
+        if not addresses:
+            return False
+        for item in addresses:
+            if not allowed_ip(item[4][0]):
+                return False
         return True
-    except Exception:
+    except (OSError, ValueError, TypeError):
         return False
+
+
+def allowed_ip_local(raw_ip: str) -> bool:
+    """Local-provider heuristic: loopback or RFC1918, never metadata."""
+    import ipaddress
+    address = ipaddress.ip_address(raw_ip)
+    if str(address) == "169.254.169.254":
+        return False
+    if isinstance(address, ipaddress.IPv6Address):
+        packed = address.packed
+        if packed[:12] == b"\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff":
+            address = ipaddress.IPv4Address(packed[12:])
+    return address.is_loopback or (address.is_private and not address.is_link_local)
+
+
+def is_allowed_base_url(url: str, provider: str) -> bool:
+    """Allow only known public provider hosts or loopback local services."""
+    from urllib.parse import urlparse
+
+    if not is_safe_url(url):
+        return False
+    host = (urlparse(url).hostname or "").lower().rstrip(".")
+    local_providers = {"lmstudio", "ollama", "llama.cpp", "llama.ccp", "llamacpp", "llamaccp"}
+    local_hosts = {"localhost", "127.0.0.1", "::1"}
+    if provider in local_providers:
+        # Local providers may be configured against any loopback or RFC1918
+        # address, or a hostname listed in SASHIMI_ALLOWED_BASE_HOSTS.
+        # Reject cloud metadata and link-local destinations only.
+        try:
+            import ipaddress
+            try:
+                address = ipaddress.ip_address(host)
+            except ValueError:
+                return host in _extra_hosts()
+            return allowed_ip_local(str(address))
+        except Exception:
+            return False
+    public_hosts = {
+        "api.openai.com", "api.mistral.ai", "openrouter.ai",
+        "api.deepseek.com", "generativelanguage.googleapis.com",
+        "api.anthropic.com",
+    }
+    return host in public_hosts or host in _extra_hosts() or host in local_hosts
+
+
+def _extra_hosts() -> set[str]:
+    return {
+        entry.strip().lower()
+        for entry in os.getenv("SASHIMI_ALLOWED_BASE_HOSTS", "").split(",")
+        if entry.strip()
+    }
 
 env = os.getenv("SASHIMI_ENV", "production").lower()
 if env != "production":

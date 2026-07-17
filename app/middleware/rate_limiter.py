@@ -63,9 +63,11 @@ class RateLimiter:
                 for cid in to_delete:
                     self.history.pop(cid, None)
                 
-                # If still over capacity, reject new client requests to protect system memory
+                # If still over capacity, evict the oldest 1,000 entries (LRU-like eviction) to avoid DoS (CWE-400)
                 if len(self.history) >= 10000:
-                    return True
+                    sorted_keys = sorted(self.history.keys(), key=lambda k: self.history[k][-1] if self.history[k] else 0)
+                    for cid in sorted_keys[:1000]:
+                        self.history.pop(cid, None)
             
             timestamps = [t for t in self.history[hashed_id] if t > cutoff]
             if len(timestamps) >= self.requests_limit:

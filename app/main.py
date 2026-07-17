@@ -15,8 +15,17 @@ import time
 from app.core.database import init_db, engine
 from app.core.security import log_audit_event, SecretRedactingFilter
 from app.orchestrator.engine import OrchestratorEngine, active_workflows, register_dashboard_callback
+from app.orchestrator.graph_orchestrator import GraphOrchestrator
 from app.core.state import ws_clients, active_tasks, active_tickets
 from app.middleware.rate_limiter import RateLimiter, api_rate_limiter, rate_limit
+
+# Next-Level-Path (Skill Builder Roadmap) Komponenten
+from app.orchestrator.schema_validator import HandoffValidator
+from app.orchestrator.acp import ACPBus
+from app.orchestrator.graph_engine import GraphEngine
+from app.memory.hybrid_memory import HybridMemory
+from app.memory.semantic_cache import SemanticCache
+from app.evaluation.llm_judge import LLMJudge
 
 # Import Routers & Re-export names for test cases to maintain backwards-compatibility
 from app.adapters.inbound.rest import (
@@ -32,10 +41,14 @@ from app.adapters.inbound.rest import (
     verify_and_consume_ticket
 )
 from app.adapters.inbound.websocket import router as ws_router
+from app.adapters.inbound.next_level import router as next_level_router
 
 # Logging konfigurieren mit Zero-Leak Filter (2.6 Log-Masking-Middleware)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-logging.getLogger().addFilter(SecretRedactingFilter())
+_secret_filter = SecretRedactingFilter()
+for _handler in logging.getLogger().handlers:
+    _handler.addFilter(_secret_filter)
+logging.getLogger().addFilter(_secret_filter)
 logger = logging.getLogger("minisashimi.main")
 
 is_prod = os.getenv("SASHIMI_ENV", "production").lower() == "production"
@@ -43,7 +56,24 @@ is_prod = os.getenv("SASHIMI_ENV", "production").lower() == "production"
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
-    
+
+    # ---- Next-Level-Path: Globale Service-Instanzen ----
+    app.state.handoff_validator = HandoffValidator(strict=True)
+    app.state.acp_bus = ACPBus()
+    app.state.hybrid_memory = HybridMemory(window_size=20)
+    app.state.semantic_cache = SemanticCache(threshold=0.92, ttl_seconds=3600)
+    app.state.llm_judge = LLMJudge(model="openai/gpt-4o", consensus_runs=1)
+
+    # Standard-Graph-Engine als App-State (für Topologie-Inspektion)
+    app.state.graph_engine = GraphEngine()
+
+    await app.state.hybrid_memory.start()
+    await app.state.semantic_cache.start()
+    logger.info(
+        "Next-Level-Path Services initialisiert: "
+        "HandoffValidator, ACPBus, HybridMemory, SemanticCache, LLMJudge, GraphEngine"
+    )
+
     ws_log_handler = WebSocketLogHandler()
     ws_log_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
     ws_log_handler.addFilter(SecretRedactingFilter())
@@ -137,11 +167,18 @@ async def lifespan(app: FastAPI):
     register_dashboard_callback(ws_update_callback)
     
     yield
-    
+
     ticket_task.cancel()
     workflow_task.cancel()
     for l in loggers_to_attach:
         l.removeHandler(ws_log_handler)
+
+    # ---- Next-Level-Path: Cleanup ----
+    try:
+        await app.state.hybrid_memory.stop()
+        await app.state.semantic_cache.stop()
+    except Exception as cleanup_err:
+        logger.warning(f"Cleanup Next-Level-Path Services: {cleanup_err}")
 
 app = FastAPI(
     title="miniSashimi Multi-Agent Proxy",
@@ -153,18 +190,21 @@ app = FastAPI(
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    # Pydantic's error dictionaries may contain the original input, which can
+    # include credentials or PII. Return only stable, non-sensitive fields.
+    safe_errors = [
+        {"loc": list(e.get("loc", ())), "type": e.get("type", "validation_error")}
+        for e in exc.errors()
+    ]
+    logger.error(f"Validation error: {safe_errors}")
     try:
         body = await request.body()
-        body_str = body.decode("utf-8", errors="ignore")
+        logger.debug("Request body length for validation error: %d", len(body))
     except Exception:
-        body_str = "<could not read body>"
-    safe_errors = [{"loc": e["loc"], "type": e["type"]} for e in exc.errors()]
-    logger.error(f"Validation error: {safe_errors}")
-    from app.core.security import sanitize_value
-    logger.error(f"Request body was: {sanitize_value(body_str)}")
+        pass
     return JSONResponse(
         status_code=422,
-        content={"detail": exc.errors()}
+        content={"detail": safe_errors}
     )
 
 # HTTP Security Header Middleware (F-009 / F-014)
@@ -175,12 +215,16 @@ async def add_security_headers(request, call_next):
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ws: wss:;"
-    response.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains; preload"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=(), payment=()"
+    if request.url.scheme == "https" or os.getenv("SASHIMI_FORCE_HSTS", "false").lower() == "true":
+        response.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains; preload"
     return response
 
 # CORS konfigurieren, damit das React Frontend zugreifen kann
 allowed_origins_str = os.getenv("SASHIMI_ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173")
 allowed_origins = [origin.strip() for origin in allowed_origins_str.split(",") if origin.strip()]
+if not allowed_origins or any(origin == "*" for origin in allowed_origins):
+    raise RuntimeError("SASHIMI_ALLOWED_ORIGINS must contain explicit origins when credentials are enabled")
 
 app.add_middleware(
     CORSMiddleware,
@@ -237,3 +281,4 @@ def health():
 # Include Routers
 app.include_router(rest_router)
 app.include_router(ws_router)
+app.include_router(next_level_router)

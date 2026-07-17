@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Header, Request, Response
+from pydantic import BaseModel, Field
 from sqlmodel import Session
 from typing import Dict, Any, List, Optional
 import os
@@ -7,14 +8,16 @@ import time
 import json
 import logging
 import asyncio
-from datetime import datetime, timezone
+import hashlib
+from datetime import datetime, timezone, timedelta
 
 from app.domain.models import (
     ChatCompletionRequest, ChatCompletionResponse, ChatCompletionChoice, 
     ChatMessage, ChatCompletionUsage, WorkflowsTable, WorkflowState, TaskStatus
 )
 from app.core.database import (
-    get_api_key, save_api_key, delete_api_key, get_setting, save_setting, engine
+    get_api_key, save_api_key, delete_api_key, get_setting, save_setting,
+    create_session, get_session, delete_session, engine
 )
 from app.core.security import encrypt_key, decrypt_key, log_audit_event
 from app.orchestrator.engine import (
@@ -27,6 +30,45 @@ logger = logging.getLogger("minisashimi.rest")
 router = APIRouter()
 
 ALLOWED_PROVIDERS = {"openai", "anthropic", "mistral", "openrouter", "deepseek", "google"}
+SESSION_TTL_SECONDS = 86_400
+MAX_MARKDOWN_OUTPUT_BYTES = 500_000
+MAX_FILE_BLOCKS = 50
+ALLOWED_SETTING_KEYS = {
+    "model_thinker", "model_conductor", "model_worker_backend",
+    "model_worker_frontend", "model_test_architect", "model_worker_integration",
+    "model_pre_verifier", "model_security_auditor", "model_performance_scout",
+    "model_dependency_watchdog", "model_visual_verifier", "model_runtime_executor",
+    "model_repository_janitor", "pii_masking_enabled", "cost_limit_usd",
+    "llm_timeout_seconds", "test_mode_enabled", "lmstudio_base_url",
+    "ollama_base_url", "llama_cpp_base_url", "token_limit",
+    "workflow_timeout_seconds",
+}
+
+
+def _hash_value(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _secure_cookie() -> bool:
+    default = "false" if os.getenv("SASHIMI_ENV", "production").lower() != "production" else "true"
+    return os.getenv("SASHIMI_COOKIE_SECURE", default).lower() == "true"
+
+
+def _session_cookie_parts(request: Request) -> Optional[tuple[str, str, int]]:
+    raw_cookie = request.cookies.get("sashimi_session")
+    if not raw_cookie:
+        return None
+    try:
+        decrypted = decrypt_key(raw_cookie)
+        session_id, csrf_token, issued_at = decrypted.split(":", 2)
+        return session_id, csrf_token, int(issued_at)
+    except (ValueError, TypeError):
+        return None
+
+
+class LoginPayload(BaseModel):
+    token: str = Field(min_length=1, max_length=512)
+
 
 def uuid_str() -> str:
     import uuid
@@ -69,6 +111,18 @@ def get_or_create_dashboard_token() -> str:
         
     return expected_token
 
+def select_write_tool_name(tools: Optional[List[Dict[str, Any]]]) -> Optional[str]:
+    if not tools:
+        return None
+    accepted = {"write", "write_file", "writeFile"}
+    for tool in tools:
+        if isinstance(tool, dict) and tool.get("type") == "function":
+            name = tool.get("function", {}).get("name")
+            if name in accepted:
+                return name
+    return None
+
+
 class AuthContext:
     def __init__(self, token: str, csrf_token: Optional[str] = None, auth_method: str = "header"):
         self.token = token
@@ -77,40 +131,47 @@ class AuthContext:
 
 def verify_token(request: Request, authorization: Optional[str] = Header(None)) -> AuthContext:
     expected_token = get_or_create_dashboard_token()
-    
+
     provided_token = None
     csrf_token = None
     auth_method = "header"
-    
-    cookie_val = request.cookies.get("sashimi_session")
-    if cookie_val:
-        try:
-            decrypted = decrypt_key(cookie_val)
-            if decrypted and ":" in decrypted:
-                parts = decrypted.split(":", 1)
-                provided_token = parts[0]
-                csrf_token = parts[1]
-                auth_method = "cookie"
-        except Exception:
-            pass
-            
-    if not provided_token:
-        if authorization and isinstance(authorization, str):
-            parts = authorization.split()
-            if len(parts) == 2 and parts[0].lower() == "bearer":
-                provided_token = parts[1]
-            else:
-                provided_token = authorization
-            auth_method = "header"
-            
+
+    cookie_parts = _session_cookie_parts(request)
+    if cookie_parts:
+        session_id, cookie_csrf, issued_at = cookie_parts
+        session = get_session(session_id)
+        now = int(time.time())
+        if session is not None:
+            expires_at = session.expires_at
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if (
+            session
+            and now - issued_at <= SESSION_TTL_SECONDS
+            and expires_at > datetime.now(timezone.utc)
+            and secrets.compare_digest(session.token_hash, _hash_value(expected_token))
+            and secrets.compare_digest(session.csrf_hash, _hash_value(cookie_csrf))
+        ):
+            provided_token = expected_token
+            csrf_token = cookie_csrf
+            auth_method = "cookie"
+
+    if not provided_token and authorization and isinstance(authorization, str):
+        parts = authorization.split()
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            provided_token = parts[1]
+        else:
+            provided_token = authorization
+        auth_method = "header"
+
     if not provided_token or not secrets.compare_digest(provided_token, expected_token):
         raise HTTPException(status_code=401, detail="Unauthorized dashboard access.")
-        
-    if auth_method == "cookie" and request.method in ("POST", "PUT", "DELETE"):
+
+    if auth_method == "cookie" and request.method in ("POST", "PUT", "PATCH", "DELETE"):
         csrf_header = request.headers.get("X-CSRF-Token")
         if not csrf_header or not csrf_token or not secrets.compare_digest(csrf_header, csrf_token):
             raise HTTPException(status_code=403, detail="CSRF token validation failed.")
-            
+
     return AuthContext(token=provided_token, csrf_token=csrf_token, auth_method=auth_method)
 
 
@@ -144,14 +205,33 @@ def extract_text_content(content: Any) -> str:
         return "\n".join(text_parts)
     return str(content) if content is not None else ""
 
+def validate_tool_path(raw_path: str) -> str:
+    """Accept only safe, relative POSIX paths for downstream write tools."""
+    from pathlib import PurePosixPath
+
+    if not isinstance(raw_path, str) or not raw_path.strip() or "\x00" in raw_path:
+        raise ValueError("Invalid tool path")
+    path = PurePosixPath(raw_path.strip())
+    if path.is_absolute() or ".." in path.parts:
+        raise ValueError("Tool path must stay within the client workspace")
+    return str(path)
+
+
 def parse_files_from_markdown(text: str):
     import re
-    pattern = r'[ \t]*###\s*FILE:\s*([^\n\r]+)\s*(?:[\r\n]+)[ \t]*```[a-zA-Z0-9#+_-]*\s*[\r\n]+(.*?)(?:[\r\n]+)[ \t]*```'
+
+    if not isinstance(text, str) or len(text.encode("utf-8")) > MAX_MARKDOWN_OUTPUT_BYTES:
+        return []
+    pattern = r'[ \t]*###\s*FILE:\s*([^\n\r]{1,4096})\s*(?:[\r\n]+)[ \t]*```[a-zA-Z0-9#+_-]*\s*[\r\n]+(.*?)(?:[\r\n]+)[ \t]*```'
     matches = re.findall(pattern, text, re.DOTALL | re.IGNORECASE)
     results = []
-    for filename, content in matches:
-        fn = filename.strip()
-        if fn:
+    for filename, content in matches[:MAX_FILE_BLOCKS]:
+        try:
+            fn = validate_tool_path(filename.strip())
+        except ValueError:
+            logger.warning("Rejected unsafe LLM tool path")
+            continue
+        if len(content.encode("utf-8")) <= 200_000:
             results.append((fn, content))
     return results
 
@@ -262,8 +342,23 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
         "model": request.model,
         "client_ip": client_ip
     })
-    
-    engine_instance = OrchestratorEngine(workflow_id, prompt)
+
+    # Feature-Flag: Graph-Engine mit Conditional Routing + Handoff-Validation
+    # Setze SASHIMI_USE_GRAPH_ENGINE=1 in der Umgebung, um den GraphOrchestrator zu nutzen.
+    use_graph = os.getenv("SASHIMI_USE_GRAPH_ENGINE", "0") == "1"
+    if use_graph:
+        from app.orchestrator.graph_orchestrator import GraphOrchestrator
+        engine_instance = GraphOrchestrator(
+            workflow_id,
+            prompt,
+            validator=http_request.app.state.handoff_validator,
+            memory=http_request.app.state.hybrid_memory,
+            cache=http_request.app.state.semantic_cache,
+            acp_bus=http_request.app.state.acp_bus,
+        )
+        logger.info(f"Workflow {workflow_id} nutzt GraphOrchestrator (Next-Level-Path)")
+    else:
+        engine_instance = OrchestratorEngine(workflow_id, prompt)
     
     # Starte die Orchestrierung in einem Hintergrund-Task
     workflow_task = asyncio.create_task(engine_instance.run())
@@ -345,15 +440,10 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                     parsed_files = parse_files_from_markdown(final_ans)
                     
                     if parsed_files and request.tools:
-                        write_tool_name = "write"
-                        client_tool_names = [t.get("function", {}).get("name") for t in request.tools if t.get("type") == "function"]
-                        if "write" in client_tool_names:
-                            write_tool_name = "write"
-                        elif "write_file" in client_tool_names:
-                            write_tool_name = "write_file"
-                        elif "writeFile" in client_tool_names:
-                            write_tool_name = "writeFile"
-                        
+                        write_tool_name = select_write_tool_name(request.tools)
+                        if not write_tool_name:
+                            parsed_files = []
+
                         for idx, (filepath, code_content) in enumerate(parsed_files):
                             tc_id = f"call_{uuid_str()[:12]}"
                             arguments = {
@@ -465,15 +555,10 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
         tool_calls = []
         parsed_files = parse_files_from_markdown(final_answer)
         if parsed_files and request.tools:
-            write_tool_name = "write"
-            client_tool_names = [t.get("function", {}).get("name") for t in request.tools if t.get("type") == "function"]
-            if "write" in client_tool_names:
-                write_tool_name = "write"
-            elif "write_file" in client_tool_names:
-                write_tool_name = "write_file"
-            elif "writeFile" in client_tool_names:
-                write_tool_name = "writeFile"
-                
+            write_tool_name = select_write_tool_name(request.tools)
+            if not write_tool_name:
+                parsed_files = []
+
             for filepath, code_content in parsed_files:
                 tc_id = f"call_{uuid_str()[:12]}"
                 arguments = {
@@ -526,29 +611,37 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
 def verify_access(auth: AuthContext = Depends(verify_token)):
     return {"status": "valid", "csrf_token": auth.csrf_token}
 
-@router.post("/api/login")
-def login(payload: Dict[str, str], response: Response):
-    token = payload.get("token", "").strip()
+@router.post("/api/login", dependencies=[Depends(rate_limit)])
+def login(payload: LoginPayload, response: Response):
+    token = payload.token.strip()
     expected_token = get_or_create_dashboard_token()
     if not token or not secrets.compare_digest(token, expected_token):
         raise HTTPException(status_code=401, detail="Invalid token")
-    
-    csrf_token = secrets.token_hex(16)
-    cookie_value = encrypt_key(f"{token}:{csrf_token}")
-    
+
+    csrf_token = secrets.token_urlsafe(32)
+    session_id = secrets.token_urlsafe(32)
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=SESSION_TTL_SECONDS)
+    create_session(session_id, expected_token, csrf_token, expires_at)
+    cookie_value = encrypt_key(f"{session_id}:{csrf_token}:{int(time.time())}")
+
     response.set_cookie(
         key="sashimi_session",
         value=cookie_value,
         httponly=True,
-        secure=False,
+        secure=_secure_cookie(),
         samesite="lax",
-        max_age=86400
+        max_age=SESSION_TTL_SECONDS,
+        path="/",
     )
     return {"status": "ok", "csrf_token": csrf_token}
 
+
 @router.post("/api/logout")
-def logout(response: Response):
-    response.delete_cookie("sashimi_session")
+def logout(request: Request, response: Response):
+    parts = _session_cookie_parts(request)
+    if parts:
+        delete_session(parts[0])
+    response.delete_cookie("sashimi_session", path="/")
     return {"status": "ok"}
 
 
@@ -605,25 +698,44 @@ def delete_key(provider: str, http_request: Request):
 
 @router.get("/api/settings", dependencies=[Depends(verify_token), Depends(rate_limit)])
 def get_settings():
-    keys = [
-        "model_thinker", "model_conductor", "model_worker_backend", 
-        "model_worker_frontend", "model_test_architect", "model_worker_integration",
-        "model_pre_verifier", "model_security_auditor", "model_performance_scout",
-        "model_dependency_watchdog", "model_visual_verifier", "model_runtime_executor",
-        "model_repository_janitor", "pii_masking_enabled", "cost_limit_usd", "llm_timeout_seconds",
-        "test_mode_enabled", "lmstudio_base_url", "ollama_base_url", "llama_cpp_base_url",
-        "token_limit", "workflow_timeout_seconds"
-    ]
-    return {k: get_setting(k) for k in keys}
+    return {k: get_setting(k) for k in sorted(ALLOWED_SETTING_KEYS)}
+
 
 @router.post("/api/settings", dependencies=[Depends(verify_token), Depends(rate_limit)])
 def update_settings(settings: Dict[str, str], http_request: Request):
-    from app.core.security import is_safe_url
-    for k, v in settings.items():
-        if k.endswith("_base_url") and v:
-            if not is_safe_url(v):
-                raise HTTPException(status_code=400, detail=f"Unsafe URL detected for setting '{k}': {v}")
-        save_setting(k, v)
+    from app.core.security import is_allowed_base_url
+
+    if len(settings) > len(ALLOWED_SETTING_KEYS):
+        raise HTTPException(status_code=400, detail="Too many settings supplied")
+
+    numeric_ranges = {
+        "cost_limit_usd": (0.01, 100_000.0),
+        "llm_timeout_seconds": (1.0, 3_600.0),
+        "token_limit": (1.0, 10_000_000.0),
+        "workflow_timeout_seconds": (1.0, 86_400.0),
+    }
+    for key, value in settings.items():
+        if key not in ALLOWED_SETTING_KEYS:
+            raise HTTPException(status_code=400, detail="Unknown setting")
+        if not isinstance(value, str) or len(value) > 2_000:
+            raise HTTPException(status_code=400, detail="Invalid setting value")
+        if key.endswith("_base_url") and value:
+            provider = key.removesuffix("_base_url")
+            if not is_allowed_base_url(value, provider):
+                raise HTTPException(status_code=400, detail="Unsafe or unapproved URL detected")
+        if key in numeric_ranges:
+            try:
+                number = float(value)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail="Invalid numeric setting") from exc
+            minimum, maximum = numeric_ranges[key]
+            if not minimum <= number <= maximum:
+                raise HTTPException(status_code=400, detail="Numeric setting out of range")
+        if key in {"pii_masking_enabled", "test_mode_enabled"} and value not in {"true", "false"}:
+            raise HTTPException(status_code=400, detail="Boolean setting must be true or false")
+
+    for key, value in settings.items():
+        save_setting(key, value)
     client_ip = http_request.client.host if http_request.client else "unknown"
     log_audit_event("settings_updated", {
         "updated_keys": list(settings.keys()),

@@ -229,6 +229,43 @@ The dashboard is a React 19 application with a **Dark Glassmorphism Theme** (Sas
 | `/health` | `GET` | Health Check (`{"status":"ok"}`) — also used as Docker Health Check |
 | `/ws` | `WebSocket` | Real-time event stream (workflow updates, log streaming, ping/pong) |
 
+### 🚀 Next-Level-Path API (Skill Builder)
+
+Based on the [DeepLearning.AI Skill Builder Feedback Report](SKILL_BUILDER_ROADMAP.md) (8.7.2026), the following endpoints expose the advanced features for multi-agent orchestration, state management, and LLM fine-tuning.
+
+| Endpoint | Method | Description |
+| :--- | :--- | :--- |
+| `/api/next-level/judge` | `POST` | LLM-as-a-Judge evaluation (6 criteria: correctness, completeness, style, security, efficiency, clarity) |
+| `/api/next-level/humaneval/run` | `POST` | HumanEval benchmark runner with sandboxed execution |
+| `/api/next-level/stats` | `GET` | Statistics for memory, cache, and handoff validator |
+| `/api/next-level/quantize` | `POST` | AWQ/GGUF quantization of fine-tuned models |
+| `/api/next-level/dpo` | `POST` | DPO (Direct Preference Optimization) training pipeline |
+| `/api/next-level/dpo/preferences/synthetic` | `POST` | Build synthetic preference pairs from worker outputs |
+| `/api/next-level/graph/topology` | `GET` | Current graph topology (nodes, edges, Mermaid) |
+| `/api/next-level/acp/send` | `POST` | Send an ACP message to a subscribed agent |
+| `/api/next-level/acp/history` | `GET` | Retrieve filtered ACP message history |
+| `/api/next-level/validate` | `POST` | Validate a handoff payload against the strict Pydantic schema |
+
+**Example: LLM-as-a-Judge**
+
+```bash
+curl -X POST http://localhost:8000/api/next-level/judge \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "code": "def add(a, b): return a + b",
+    "task_description": "Write a function to add two numbers",
+    "reference": "Should return the sum of two integers"
+  }'
+```
+
+**Example: Hybrid Memory Stats**
+
+```bash
+curl http://localhost:8000/api/next-level/stats \
+  -H "Authorization: Bearer $TOKEN"
+```
+
 ---
 
 ## 🔄 Tool Call Generation
@@ -298,6 +335,52 @@ The system was hardened following the "Assume Breach" principle and strictly con
 *   **Swagger/OpenAPI Disabled in Production:** When `SASHIMI_ENV=production`, Swagger UI, ReDoc, and the OpenAPI schema are automatically disabled.
 
 For more details on the security architecture and resolved vulnerabilities, please check [REMEDIATION_REPORT.md](REMEDIATION_REPORT.md) and [SECURITY.md](SECURITY.md).
+
+---
+
+## 🧠 Next-Level-Path Features (Skill Builder Roadmap)
+
+Based on the [DeepLearning.AI Skill Builder Feedback Report](SKILL_BUILDER_ROADMAP.md) (8.7.2026), `miniSashimi` has been extended with the following enterprise-grade capabilities:
+
+### 1. Multi-Agent Orchestration & Routing
+- **Strict Schema Validation** (`app/orchestrator/schema_validator.py`): Pydantic contracts for every agent handoff (Thinker → Conductor → Worker → Verifier → Security → Synthesis) with field validation, severity tagging, CWE/CVSS scores, and automatic coercion of LLM output variants.
+- **Graph Engine** (`app/orchestrator/graph_engine.py`): LangGraph-style state machine with explicit nodes, conditional edges (Lambda routing), max-iterations protection, Mermaid visualization, and an abort-reason audit trail.
+- **Agent Communication Protocol (ACP)** (`app/orchestrator/acp.py`): Standardized request/response/event/broadcast messaging with TTL, payload-size limits, and a filterable history.
+
+### 2. State Management & Vector Databases
+- **Hybrid Memory** (`app/memory/hybrid_memory.py`): Sliding window for active context + LanceDB vector store for long-term history. Auto-eviction, metadata filtering (phase, workflow, agent, tags, timestamp), and `build_context()` for LLM context reconstruction.
+- **LanceDB Store** (`app/memory/lancedb_store.py`): Async wrapper with metadata-aware search, graceful in-memory fallback, and DSGVO-compliant local processing.
+- **Semantic Cache** (`app/memory/semantic_cache.py`): Embedding-similarity-based LLM-response cache with TTL, LRU eviction, hit-rate metrics, and per-workflow invalidation.
+- **Embedder** (`app/memory/embeddings.py`): Multi-provider embeddings (sentence-transformers → Ollama → hash-fallback).
+
+### 3. Local LLM Fine-Tuning & Optimization
+- **LLM-as-a-Judge** (`app/evaluation/llm_judge.py`): Systematic code/output evaluation with 6 weighted criteria, multi-run consensus for bias reduction, and a comparison mode for A/B testing.
+- **HumanEval Runner** (`app/evaluation/humaneval_runner.py`): Sandboxed benchmark execution (subprocess with 10s timeout) reporting pass@1 metrics for fine-tuned models.
+- **Quantization Helper** (`app/finetuning/quantization.py`): AWQ (4-bit, GPU) and GGUF (q2_k, q4_k_m, q5_k_m, q8_0) quantization with hardware-aware recommendations and path-traversal protection (CWE-22).
+- **DPO Trainer** (`app/finetuning/dpo_trainer.py`): Direct Preference Optimization pipeline with synthetic preference generation from worker outputs, configurable hyperparameters, and a one-click `DPO → GGUF` export.
+
+### Optional Dependencies
+
+The new modules work with minimal dependencies. Recommended for full functionality:
+
+| Package | Purpose | Install |
+| :--- | :--- | :--- |
+| `lancedb pyarrow` | Vector Store for Hybrid Memory | `pip install lancedb pyarrow` |
+| `sentence-transformers` | High-quality local embeddings | `pip install sentence-transformers` |
+| `autoawq` | AWQ quantization for GPU inference | `pip install autoawq` |
+| `trl datasets transformers` | DPO training pipeline | `pip install trl datasets transformers` |
+
+All modules have functional fallbacks when dependencies are missing.
+
+### Tests
+
+28 new tests in `tests/test_next_level.py` validate the Next-Level-Path components:
+
+```bash
+.venv/bin/python -m pytest tests/test_next_level.py -v
+```
+
+Expected result: **28 passed in ~0.3s**
 
 ---
 
@@ -439,18 +522,37 @@ miniSashimi/
 ├── app/
 │   ├── main.py                 # FastAPI app, REST endpoints, WebSocket, middleware
 │   ├── adapters/
+│   │   ├── inbound/
+│   │   │   ├── next_level.py   # Next-Level-Path REST endpoints (Skill Builder)
+│   │   │   ├── rest.py         # Dashboard/Workflow REST API
+│   │   │   └── websocket.py    # WebSocket route
 │   │   └── outbound/
 │   │       └── llm/
 │   │           └── client.py   # Multi-provider LLM client with intelligent routing
 │   ├── core/
 │   │   ├── database.py         # SQLite access (WAL), encrypted keys, settings, workflows
-│   │   └── security.py         # Fernet encryption, audit logs, SecretRedactingFilter
+│   │   ├── security.py         # Fernet encryption, audit logs, SecretRedactingFilter
+│   │   └── state.py            # WebSocket & ticket state
 │   ├── domain/
 │   │   └── models.py           # Pydantic models (ChatCompletion, Task, WorkflowState)
 │   ├── middleware/
 │   │   └── anonymizer.py       # PII masking (Boundary Anonymizer)
-│   └── orchestrator/
-│       └── engine.py           # Multi-agent orchestration, phase routing, streaming
+│   ├── memory/                 # Next-Level: Hybrid Memory, LanceDB, Semantic Cache
+│   │   ├── embeddings.py
+│   │   ├── hybrid_memory.py
+│   │   ├── lancedb_store.py
+│   │   └── semantic_cache.py
+│   ├── orchestrator/
+│   │   ├── engine.py           # Multi-agent orchestration, phase routing, streaming
+│   │   ├── graph_engine.py     # Next-Level: LangGraph-style state machine
+│   │   ├── schema_validator.py # Next-Level: Strict Pydantic handoff contracts
+│   │   └── acp.py              # Next-Level: Agent Communication Protocol
+│   ├── evaluation/             # Next-Level: LLM-as-a-Judge, HumanEval
+│   │   ├── llm_judge.py
+│   │   └── humaneval_runner.py
+│   └── finetuning/             # Next-Level: AWQ/GGUF, DPO Trainer
+│       ├── quantization.py
+│       └── dpo_trainer.py
 ├── dashboard/
 │   └── src/
 │       ├── App.jsx             # React dashboard (Workflows + Settings)
@@ -461,6 +563,7 @@ miniSashimi/
 ├── tests/                      # Unit and regression tests
 ├── docker-compose.yml          # Docker Compose setup with resource limits
 ├── requirements.txt            # Python dependencies
+├── SKILL_BUILDER_ROADMAP.md    # Next-Level-Path implementation roadmap
 ├── ARCHITECTURE.md             # Hexagonal Architecture documentation
 ├── SECURITY.md                 # Security guidelines
 └── REMEDIATION_REPORT.md       # Resolved security vulnerabilities

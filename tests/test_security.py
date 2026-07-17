@@ -49,7 +49,8 @@ def test_rate_limiter_capacity():
         return await limiter.check_rate_limit("client_new")
         
     result = asyncio.run(run_check())
-    assert result is True  # Rejected due to capacity limit
+    assert result is False  # Not rejected, oldest keys were evicted instead!
+    assert len(limiter.history) < 10000  # Eviction freed space
     
     # Clean up history by pushing timestamps into past
     past = time.time() - 20.0
@@ -80,6 +81,10 @@ def test_google_provider_config():
 
 def test_cost_limit_enforcement():
     from app.orchestrator.engine import OrchestratorEngine
+    from app.core.database import init_db, save_setting
+
+    init_db()
+    save_setting("cost_limit_usd", "10.0")
     
     engine = OrchestratorEngine("test-wf-cost-limit", "dummy prompt")
     engine.state.accumulated_cost_usd = 15.0  # Above default limit of 10.0
@@ -117,11 +122,9 @@ def test_anonymizer_capacity_limit():
         def group(self, index):
             return "new_secret_value"
             
-    try:
-        anonymizer._replace_and_store(FakeMatch(), "TEST")
-        assert False, "Should have raised ValueError due to anonymizer capacity limit"
-    except ValueError as e:
-        assert "capacity" in str(e)
+    res = anonymizer._replace_and_store(FakeMatch(), "TEST")
+    assert res == "new_secret_value"  # Gracefully returns original value without throwing
+    assert len(anonymizer.mask_map) == 5000  # Map size remains capped
 
 def test_ssrf_url_validation():
     from app.core.security import is_safe_url
@@ -156,7 +159,9 @@ def test_cookie_auth_and_csrf_validation():
     from fastapi.testclient import TestClient
     from app.main import app
     from app.adapters.inbound.rest import get_or_create_dashboard_token
-    
+    from app.core.database import init_db
+
+    init_db()
     client = TestClient(app)
     dashboard_token = get_or_create_dashboard_token()
     
@@ -180,4 +185,59 @@ def test_cookie_auth_and_csrf_validation():
     # 4. Test mutating endpoint with cookie AND correct CSRF header -> must return 200
     res = client.post("/api/settings", json={"cost_limit_usd": "12.0"}, headers={"X-CSRF-Token": csrf_token})
     assert res.status_code == 200
+
+
+def test_database_permissions():
+    from app.core.database import init_db, DATABASE_FILE
+    
+    init_db()
+    assert os.path.exists(DATABASE_FILE)
+    
+    mode = os.stat(DATABASE_FILE).st_mode
+    # Ensure that group and others permissions are 0 (e.g. 0o600 or 0o700 equivalent)
+    assert (mode & 0o077) == 0
+
+
+def test_quantization_unsafe_files_protection():
+    import tempfile
+    import shutil
+    from pathlib import Path
+    from app.finetuning.quantization import QuantizationHelper
+    
+    tmpdir = tempfile.mkdtemp()
+    try:
+        helper = QuantizationHelper()
+        # Mock self.MODEL_ROOT to allow our test paths
+        helper.MODEL_ROOT = Path(tmpdir)
+        
+        # Create a model dir with unsafe file
+        model_dir = Path(tmpdir) / "test_model"
+        model_dir.mkdir()
+        unsafe_file = model_dir / "pytorch_model.bin"
+        unsafe_file.write_text("dummy binary content")
+        
+        # Output path
+        output_dir = Path(tmpdir) / "output_model"
+        
+        # Call quantize_gguf
+        import asyncio
+        async def run_gguf():
+            return await helper.quantize_gguf(str(model_dir), str(output_dir))
+            
+        result = asyncio.run(run_gguf())
+        assert result.success is False
+        assert "Unsafe model files" in result.error
+        
+        # Bypass check by setting env var
+        os.environ["SASHIMI_ALLOW_UNSAFE_MODELS"] = "true"
+        try:
+            result_bypass = asyncio.run(run_gguf())
+            # It should bypass the unsafe check and fail on convert.py not found/existing, but NOT with Unsafe error
+            assert "Unsafe model files" not in (result_bypass.error or "")
+        finally:
+            del os.environ["SASHIMI_ALLOW_UNSAFE_MODELS"]
+            
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
 

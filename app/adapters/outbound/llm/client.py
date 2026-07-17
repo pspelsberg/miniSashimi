@@ -16,17 +16,23 @@ def get_httpx_client() -> httpx.AsyncClient:
     global _httpx_client
     if _httpx_client is None:
         try:
-            t = float(get_setting("llm_timeout_seconds", "300.0"))
+            t = max(1.0, min(float(get_setting("llm_timeout_seconds", "300.0")), 3_600.0))
         except Exception:
             t = 300.0
-        _httpx_client = httpx.AsyncClient(timeout=t)
+        _httpx_client = httpx.AsyncClient(
+            timeout=t,
+            limits=httpx.Limits(max_connections=32, max_keepalive_connections=16),
+        )
     return _httpx_client
 
 def get_openai_client(provider: str, api_key: str, base_url: str, extra_headers: Dict[str, str]) -> AsyncOpenAI:
-    cache_key = f"{provider}:{api_key}:{base_url}"
+    import hashlib
+    # F-002: Hash the API key so the raw credential is never stored as a dict key (CWE-256)
+    key_hash = hashlib.sha256(api_key.encode()).hexdigest()[:16]
+    cache_key = f"{provider}:{key_hash}:{base_url}"
     if cache_key not in _openai_clients:
         try:
-            t = float(get_setting("llm_timeout_seconds", "300.0"))
+            t = max(1.0, min(float(get_setting("llm_timeout_seconds", "300.0")), 3_600.0))
         except Exception:
             t = 300.0
         _openai_clients[cache_key] = AsyncOpenAI(
@@ -131,10 +137,10 @@ async def call_llm(model_string: str, messages: List[Dict[str, str]], temperatur
                 base_url = "https://api.openai.com/v1"
                 logger.warning(f"Unbekannter Provider '{provider}'. Versuche standardmaessig OpenAI-Schnittstelle.")
 
-            # Validate base_url for SSRF safety (CWE-918)
-            from app.core.security import is_safe_url
-            if not is_safe_url(base_url):
-                raise ValueError(f"Aborted outbound call to unsafe base URL: {base_url}")
+            # Validate both the URL class and the provider-specific hostname.
+            from app.core.security import is_allowed_base_url
+            if not is_allowed_base_url(base_url, provider):
+                raise ValueError("Outbound base URL is not approved for this provider")
 
             # OpenRouter benötigt spezielle Header
             extra_headers = {}
@@ -147,12 +153,12 @@ async def call_llm(model_string: str, messages: List[Dict[str, str]], temperatur
             client = get_openai_client(provider, api_key, base_url, extra_headers)
             
             try:
-                t = float(get_setting("llm_timeout_seconds", "300.0"))
+                t = max(1.0, min(float(get_setting("llm_timeout_seconds", "300.0")), 3_600.0))
             except Exception:
                 t = 300.0
             kwargs = {
                 "model": model,
-                "messages": messages, # type: ignore
+                "messages": messages,  # type: ignore
                 "timeout": t,
             }
             # Omit temperature for reasoning models that do not support it
@@ -246,7 +252,7 @@ async def _call_anthropic_native(model: str, messages: List[Dict[str, str]], api
     client = get_httpx_client()
     try:
         try:
-            t = float(get_setting("llm_timeout_seconds", "300.0"))
+            t = max(1.0, min(float(get_setting("llm_timeout_seconds", "300.0")), 3_600.0))
         except Exception:
             t = 300.0
         response = await client.post(url, headers=headers, json=payload, timeout=t)

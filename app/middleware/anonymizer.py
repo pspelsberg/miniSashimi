@@ -11,14 +11,20 @@ API_KEY_REGEX = re.compile(r'\b(?:sk-[a-zA-Z0-9]{32,}|sk-ant-[a-zA-Z0-9-]{40,}|g
 CREDIT_CARD_REGEX = re.compile(r'\b(?:\d[ -]*?){13,16}\b')
 # Telefonnummern
 PHONE_REGEX = re.compile(r'\b(?:\+\d{1,3}[- ]?)?\(?\d{2,4}\)?[- ]?\d{3,4}[- ]?\d{3,6}\b')
-# ZIP und Straßennamen (z.B. PLZ 12345 oder Hauptstraße/Hauptstr.)
-ZIP_STREET_REGEX = re.compile(r'\b\d{5}\b|\b[A-ZÄÖÜ][a-zäöüß]+(?:str\.|straße|weg|platz|allee)\b', re.IGNORECASE)
+# ZIP und Straßennamen (z.B. PLZ 12345 oder Hauptstraße/Hauptstr. / 12345 Berlin)
+ZIP_STREET_REGEX = re.compile(
+    r'\bplz\s*\d{5}\b|\b\d{5}\s+[A-ZÄÖÜa-zäöüß]+\b|\b[A-ZÄÖÜ][a-zäöüß]+(?:str\.|straße|weg|platz|allee)\b',
+    re.IGNORECASE
+)
 # Kontextbasierte Erkennung von Namen (z.B. Herr/Frau Schmidt, Mein Name ist John)
 NAME_CONTEXT_REGEX = re.compile(
     r'\b(?:herr|frau|dr\.|prof\.)\s+([A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+)?)\b|'
     r'\b(?:name\s+(?:ist|is|name:))\s+([A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+)?)\b',
     re.IGNORECASE
 )
+
+import logging
+logger = logging.getLogger("minisashimi.middleware.anonymizer")
 
 class Anonymizer:
     """
@@ -40,7 +46,8 @@ class Anonymizer:
         
         # Defense-in-depth: limit mask_map capacity to prevent memory exhaustion / DoS (CWE-400 / LLM10:2025)
         if len(self.mask_map) >= 5000:
-            raise ValueError("Maximum anonymization mapping capacity reached (5000 entries limit).")
+            logger.warning("Maximum anonymization mapping capacity reached (5000 entries limit). Gracefully skipping further masking.")
+            return original
             
         self.counter += 1
         placeholder = f"[{token_type}_{self.counter}]"

@@ -1,6 +1,6 @@
 from typing import List, Dict, Optional, Any, Union
 from enum import Enum
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlmodel import SQLModel, Field as SQLField
 from datetime import datetime, timezone
 import uuid
@@ -62,26 +62,45 @@ class WorkflowsTable(SQLModel, table=True):
     state_json: str = SQLField(default="{}")
     updated_at: datetime = SQLField(default_factory=lambda: datetime.now(timezone.utc))
 
+
+class SessionTable(SQLModel, table=True):
+    """Server-side session metadata; only credential hashes are persisted."""
+    __tablename__ = "sessions"
+    session_id: str = SQLField(primary_key=True, index=True, max_length=128)
+    token_hash: str = SQLField(max_length=64)
+    csrf_hash: str = SQLField(max_length=64)
+    expires_at: datetime = SQLField(index=True)
+
 # Pydantic-Modelle für API-Requests/Responses (OpenAI-Kompatibilität)
 class ChatMessage(BaseModel):
-    role: str
+    role: str = Field(min_length=1, max_length=32)
     content: Optional[Union[str, List[Any]]] = None
-    name: Optional[str] = None
-    tool_calls: Optional[List[Dict[str, Any]]] = None
+    name: Optional[str] = Field(default=None, max_length=128)
+    tool_calls: Optional[List[Dict[str, Any]]] = Field(default=None, max_length=32)
+
+    @field_validator("content")
+    @classmethod
+    def validate_content_size(cls, value: Optional[Union[str, List[Any]]]):
+        if isinstance(value, str) and len(value) > 100_000:
+            raise ValueError("message content exceeds the maximum length")
+        if isinstance(value, list) and len(value) > 128:
+            raise ValueError("message content parts exceed the maximum count")
+        return value
+
 
 class ChatCompletionRequest(BaseModel):
-    model: str
-    messages: List[ChatMessage]
-    temperature: Optional[float] = 1.0
-    top_p: Optional[float] = 1.0
-    n: Optional[int] = 1
+    model: str = Field(min_length=1, max_length=256)
+    messages: List[ChatMessage] = Field(min_length=1, max_length=100)
+    temperature: Optional[float] = Field(default=1.0, ge=0.0, le=2.0)
+    top_p: Optional[float] = Field(default=1.0, ge=0.0, le=1.0)
+    n: Optional[int] = Field(default=1, ge=1, le=8)
     stream: Optional[bool] = False
     stop: Optional[Union[str, List[str]]] = None
-    max_tokens: Optional[int] = None
-    presence_penalty: Optional[float] = 0.0
-    frequency_penalty: Optional[float] = 0.0
-    user: Optional[str] = None
-    tools: Optional[List[Dict[str, Any]]] = None
+    max_tokens: Optional[int] = Field(default=None, ge=1, le=8192)
+    presence_penalty: Optional[float] = Field(default=0.0, ge=-2.0, le=2.0)
+    frequency_penalty: Optional[float] = Field(default=0.0, ge=-2.0, le=2.0)
+    user: Optional[str] = Field(default=None, max_length=256)
+    tools: Optional[List[Dict[str, Any]]] = Field(default=None, max_length=32)
     tool_choice: Optional[Union[str, Dict[str, Any]]] = None
 
 class ChatCompletionChoice(BaseModel):
