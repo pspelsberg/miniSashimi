@@ -16,7 +16,7 @@ from app.core.database import init_db, engine
 from app.core.security import log_audit_event, SecretRedactingFilter
 from app.orchestrator.engine import OrchestratorEngine, active_workflows, register_dashboard_callback
 from app.orchestrator.graph_orchestrator import GraphOrchestrator
-from app.core.state import ws_clients, active_tasks, active_tickets
+from app.core.state import ws_clients, ws_clients_lock, active_tasks, active_tickets
 from app.middleware.rate_limiter import RateLimiter, api_rate_limiter, rate_limit
 
 # Next-Level-Path (Skill Builder Roadmap) Komponenten
@@ -52,6 +52,10 @@ logging.getLogger().addFilter(_secret_filter)
 logger = logging.getLogger("minisashimi.main")
 
 is_prod = os.getenv("SASHIMI_ENV", "production").lower() == "production"
+MAX_REQUEST_BYTES = 16 * 1024 * 1024
+
+class RequestTooLarge(Exception):
+    pass
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -154,15 +158,19 @@ async def lifespan(app: FastAPI):
     workflow_task = asyncio.create_task(workflow_cleanup_loop())
     
     async def ws_update_callback(message: Dict[str, Any]):
+        async with ws_clients_lock:
+            clients = list(ws_clients)
         dead_clients = []
-        for client in list(ws_clients):
+        for client in clients:
             try:
                 await client.send_text(json.dumps(message))
             except Exception:
                 dead_clients.append(client)
-        for client in dead_clients:
-            if client in ws_clients:
-                ws_clients.remove(client)
+        if dead_clients:
+            async with ws_clients_lock:
+                for client in dead_clients:
+                    if client in ws_clients:
+                        ws_clients.remove(client)
                 
     register_dashboard_callback(ws_update_callback)
     
@@ -188,6 +196,10 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+@app.exception_handler(RequestTooLarge)
+async def request_too_large_handler(request: Request, exc: RequestTooLarge):
+    return JSONResponse(status_code=413, content={"detail": "Request body too large"})
+
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     # Pydantic's error dictionaries may contain the original input, which can
@@ -207,6 +219,34 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         content={"detail": safe_errors}
     )
 
+@app.middleware("http")
+async def limit_request_size(request: Request, call_next):
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > MAX_REQUEST_BYTES:
+                return JSONResponse(status_code=413, content={"detail": "Request body too large"})
+        except ValueError:
+            return JSONResponse(status_code=400, content={"detail": "Invalid Content-Length"})
+
+    received = 0
+    original_receive = request._receive
+
+    async def limited_receive():
+        nonlocal received
+        message = await original_receive()
+        if message.get("type") == "http.request":
+            received += len(message.get("body", b""))
+            if received > MAX_REQUEST_BYTES:
+                raise RequestTooLarge()
+        return message
+
+    request._receive = limited_receive
+    try:
+        return await call_next(request)
+    except RequestTooLarge:
+        return JSONResponse(status_code=413, content={"detail": "Request body too large"})
+
 # HTTP Security Header Middleware (F-009 / F-014)
 @app.middleware("http")
 async def add_security_headers(request, call_next):
@@ -216,6 +256,9 @@ async def add_security_headers(request, call_next):
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ws: wss:;"
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=(), payment=()"
+    if request.url.path == "/v1/chat/completions":
+        # Machine-readable transparency signal for generated AI output.
+        response.headers["X-AI-Generated"] = "true"
     if request.url.scheme == "https" or os.getenv("SASHIMI_FORCE_HSTS", "false").lower() == "true":
         response.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains; preload"
     return response
@@ -262,15 +305,19 @@ class WebSocketLogHandler(logging.Handler):
             pass
 
 async def broadcast_log_to_ws(message: Dict[str, Any]):
+    async with ws_clients_lock:
+        clients = list(ws_clients)
     dead_clients = []
-    for client in list(ws_clients):
+    for client in clients:
         try:
             await client.send_text(json.dumps(message))
         except Exception:
             dead_clients.append(client)
-    for client in dead_clients:
-        if client in ws_clients:
-            ws_clients.remove(client)
+    if dead_clients:
+        async with ws_clients_lock:
+            for client in dead_clients:
+                if client in ws_clients:
+                    ws_clients.remove(client)
 
 
 

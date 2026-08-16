@@ -4,6 +4,7 @@ from fastapi import WebSocket
 
 # Liste der aktiven WebSocket-Verbindungen (Dashboard Clients)
 ws_clients: List[WebSocket] = []
+ws_clients_lock = asyncio.Lock()
 
 # Registrierung der aktiv laufenden Workflow-Tasks
 active_tasks: Dict[str, asyncio.Task] = {}

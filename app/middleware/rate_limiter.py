@@ -81,6 +81,17 @@ RATE_LIMIT_REQUESTS = int(os.getenv("SASHIMI_RATE_LIMIT_REQUESTS", "60"))
 RATE_LIMIT_WINDOW = int(os.getenv("SASHIMI_RATE_LIMIT_WINDOW", "60"))
 
 api_rate_limiter = RateLimiter(requests_limit=RATE_LIMIT_REQUESTS, window_seconds=RATE_LIMIT_WINDOW)
+# Authentication endpoints get an intentionally stricter independent budget so
+# a valid session cannot be used to make password/token guessing cheap.
+login_rate_limiter = RateLimiter(
+    requests_limit=int(os.getenv("SASHIMI_LOGIN_RATE_LIMIT_REQUESTS", "5")),
+    window_seconds=int(os.getenv("SASHIMI_LOGIN_RATE_LIMIT_WINDOW", "300")),
+)
+
+async def login_rate_limit(request: Request):
+    client_ip = request.client.host if request.client else "unknown"
+    if await login_rate_limiter.check_rate_limit(client_ip):
+        raise HTTPException(status_code=429, detail="Too many login attempts")
 
 async def rate_limit(request: Request):
     # Verwende Authorization-Token oder Client-IP (unter Berücksichtigung von Reverse-Proxys) als Identifikator

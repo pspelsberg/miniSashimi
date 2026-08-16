@@ -21,16 +21,23 @@ SECRET_MASK_REGEX = re.compile(
 
 class SecretRedactingFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
-        if isinstance(record.msg, str):
-            record.msg = SECRET_MASK_REGEX.sub("••••••••••••", record.msg)
+        def redact(value: Any) -> Any:
+            if isinstance(value, str):
+                return SECRET_MASK_REGEX.sub("••••••••••••", value)
+            if isinstance(value, dict):
+                return {key: redact(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [redact(item) for item in value]
+            if isinstance(value, tuple):
+                return tuple(redact(item) for item in value)
+            # Exceptions and custom objects can format to provider responses.
+            if value is not None and not isinstance(value, (int, float, bool)):
+                return SECRET_MASK_REGEX.sub("••••••••••••", str(value))
+            return value
+
+        record.msg = redact(record.msg)
         if record.args:
-            new_args = []
-            for arg in record.args:
-                if isinstance(arg, str):
-                    new_args.append(SECRET_MASK_REGEX.sub("••••••••••••", arg))
-                else:
-                    new_args.append(arg)
-            record.args = tuple(new_args)
+            record.args = tuple(redact(arg) for arg in record.args) if isinstance(record.args, tuple) else redact(record.args)
         return True
 
 def sanitize_value(val: Any) -> Any:
@@ -42,7 +49,7 @@ def sanitize_value(val: Any) -> Any:
         return [sanitize_value(item) for item in val]
     return val
 
-def is_safe_url(url: str) -> bool:
+def is_safe_url(url: str, *, allow_loopback: bool = True) -> bool:
     """Validate an outbound URL against private-network and metadata SSRF targets."""
     from urllib.parse import urlparse
     import ipaddress
@@ -62,7 +69,7 @@ def is_safe_url(url: str) -> bool:
                 return False
             # Loopback is required for explicitly configured local LLM services.
             if address.is_loopback:
-                return True
+                return allow_loopback
             # Translate IPv4-mapped and NAT64-wrapped IPv6 addresses so that
             # they are evaluated against the embedded IPv4 range instead of
             # being reported as link-local / reserved by the IPv6 classifier.
@@ -88,12 +95,6 @@ def is_safe_url(url: str) -> bool:
             literal = None
         if literal is not None:
             return allowed_ip(str(literal))
-
-        # Operators can pre-register placeholder hostnames (e.g. local test
-        # environments) that have no public DNS record. Such entries bypass
-        # the IP address check entirely.
-        if hostname in _extra_hosts():
-            return True
 
         # Resolve every returned address; DNS-rebinding or local destinations
         # are caught when at least one address fails the allowlist.
@@ -125,37 +126,57 @@ def allowed_ip_local(raw_ip: str) -> bool:
         packed = address.packed
         if packed[:12] == b"\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff":
             address = ipaddress.IPv4Address(packed[12:])
-    return address.is_loopback or (address.is_private and not address.is_link_local)
+        elif packed[:4] == b"\x00\x64\xff\x9b":
+            address = ipaddress.IPv4Address(int.from_bytes(packed[12:], "big"))
+        elif address.sixtofour is not None:
+            address = ipaddress.IPv4Address(address.sixtofour[1])
+    return (
+        address.is_loopback
+        or (address.is_private and not address.is_link_local
+            and not address.is_unspecified and not address.is_reserved
+            and not address.is_multicast)
+    )
 
 
 def is_allowed_base_url(url: str, provider: str) -> bool:
-    """Allow only known public provider hosts or loopback local services."""
-    from urllib.parse import urlparse
+    """Allow only approved HTTPS provider hosts or explicitly configured local services.
 
-    if not is_safe_url(url):
+    Local services are the only exception to the public-address policy.  An
+    operator allowlist is intentionally exact-match and never a wildcard.
+    """
+    from urllib.parse import urlparse
+    import ipaddress
+
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or parsed.username or parsed.password:
         return False
-    host = (urlparse(url).hostname or "").lower().rstrip(".")
+    if parsed.query or parsed.fragment or not parsed.hostname:
+        return False
+
+    host = parsed.hostname.lower().rstrip(".")
     local_providers = {"lmstudio", "ollama", "llama.cpp", "llama.ccp", "llamacpp", "llamaccp"}
-    local_hosts = {"localhost", "127.0.0.1", "::1"}
     if provider in local_providers:
-        # Local providers may be configured against any loopback or RFC1918
-        # address, or a hostname listed in SASHIMI_ALLOWED_BASE_HOSTS.
-        # Reject cloud metadata and link-local destinations only.
+        # Local LLMs may use loopback/RFC1918 addresses.  Named test/dev
+        # endpoints must be explicitly allowlisted by the operator.
+        if host in _extra_hosts():
+            return True
         try:
-            import ipaddress
-            try:
-                address = ipaddress.ip_address(host)
-            except ValueError:
-                return host in _extra_hosts()
-            return allowed_ip_local(str(address))
-        except Exception:
-            return False
+            address = ipaddress.ip_address(host)
+        except ValueError:
+            return is_safe_url(url) and host == "localhost"
+        return parsed.scheme == "http" and allowed_ip_local(str(address))
+
+    # Credentials must never be sent to a public provider over plaintext HTTP.
+    if parsed.scheme != "https" or parsed.port not in (None, 443):
+        return False
     public_hosts = {
         "api.openai.com", "api.mistral.ai", "openrouter.ai",
         "api.deepseek.com", "generativelanguage.googleapis.com",
         "api.anthropic.com",
     }
-    return host in public_hosts or host in _extra_hosts() or host in local_hosts
+    if host not in public_hosts and host not in _extra_hosts():
+        return False
+    return is_safe_url(url, allow_loopback=False)
 
 
 def _extra_hosts() -> set[str]:

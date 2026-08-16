@@ -238,7 +238,7 @@ Welcher Output ist besser? Antworte im JSON-Format:
             return _safe_json_parse(content)
         except Exception as e:
             logger.error(f"Compare fehlgeschlagen: {e}")
-            return {"error": str(e)}
+            return {"error": "comparison_failed"}
 
 
 def _parse_judge_response(content: str) -> JudgmentResult:

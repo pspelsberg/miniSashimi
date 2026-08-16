@@ -21,6 +21,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -79,7 +80,11 @@ class QuantizationHelper:
     """
 
     MODEL_ROOT = configured_root("SASHIMI_MODEL_ROOT", "./models")
-    MAX_OUTPUT_SIZE_GB = 50
+    LLAMA_CPP_ROOT = configured_root("SASHIMI_LLAMA_CPP_ROOT", "./llama.cpp")
+    try:
+        MAX_OUTPUT_SIZE_GB = max(1, min(int(os.getenv("SASHIMI_MAX_OUTPUT_GB", "8")), 50))
+    except ValueError:
+        MAX_OUTPUT_SIZE_GB = 8
     PROCESS_TIMEOUT_SECONDS = 3_600
 
     def _validate_paths(self, *paths: str) -> List[Path]:
@@ -110,6 +115,39 @@ class QuantizationHelper:
                 "Set SASHIMI_ALLOW_UNSAFE_MODELS=true to bypass this check."
             )
         return None
+
+    def _run_bounded_process(self, command: List[str], output_path: Path) -> tuple[int, str, str]:
+        """Run trusted conversion tooling with timeout and live disk bounds."""
+        proc = subprocess.Popen(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            cwd=str(output_path),
+        )
+        deadline = time.monotonic() + self.PROCESS_TIMEOUT_SECONDS
+        try:
+            while proc.poll() is None:
+                if time.monotonic() > deadline:
+                    proc.kill()
+                    stdout, stderr = proc.communicate()
+                    return -1, stdout or "", "conversion timeout"
+                try:
+                    ensure_directory_size(
+                        output_path,
+                        max_bytes=self.MAX_OUTPUT_SIZE_GB * 1024 * 1024 * 1024,
+                    )
+                except UnsafePathError:
+                    proc.kill()
+                    stdout, stderr = proc.communicate()
+                    return -1, stdout or "", "conversion output exceeds the configured size limit"
+                time.sleep(0.25)
+            stdout, stderr = proc.communicate()
+            return proc.returncode or 0, stdout or "", stderr or ""
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate()
 
     async def quantize_awq(
         self,
@@ -199,7 +237,7 @@ class QuantizationHelper:
                 success=False,
                 output_path=output_path,
                 format=QuantFormat.AWQ,
-                error=str(e),
+                error="Quantization failed",
             )
 
     async def quantize_gguf(
@@ -246,40 +284,45 @@ class QuantizationHelper:
         Path(output_path).mkdir(parents=True, exist_ok=True)
 
         try:
+            # Resolve tools from an operator-configured, trusted directory;
+            # never execute a relative path supplied by the request's cwd.
+            convert_tool = self.LLAMA_CPP_ROOT / "convert.py"
+            quantize_tool = self.LLAMA_CPP_ROOT / "quantize"
+            if not convert_tool.is_file() or not quantize_tool.is_file():
+                return QuantizationResult(
+                    success=False,
+                    output_path=output_path,
+                    format=QuantFormat.GGUF,
+                    error="llama.cpp tools are not configured",
+                )
             cmd_convert = [
-                sys.executable, "llama.cpp/convert.py",
+                sys.executable, str(convert_tool),
                 model_path,
                 "--outfile", str(Path(output_path) / "model.f16.gguf"),
                 "--outtype", "f16",
             ]
-            proc1 = subprocess.run(
-                cmd_convert, capture_output=True, text=True, check=False,
-                timeout=self.PROCESS_TIMEOUT_SECONDS,
-            )
-            if proc1.returncode != 0:
+            proc1_returncode, _, proc1_stderr = self._run_bounded_process(cmd_convert, Path(output_path))
+            if proc1_returncode != 0:
                 return QuantizationResult(
                     success=False,
                     output_path=output_path,
                     format=QuantFormat.GGUF,
-                    error=f"convert.py fehlgeschlagen: {proc1.stderr[:500]}",
+                    error=f"convert.py fehlgeschlagen: {proc1_stderr[:500]}",
                 )
 
             cmd_quant = [
-                "llama.cpp/quantize",
+                str(quantize_tool),
                 str(Path(output_path) / "model.f16.gguf"),
                 str(Path(output_path) / f"model.{quant_type}.gguf"),
                 quant_type,
             ]
-            proc2 = subprocess.run(
-                cmd_quant, capture_output=True, text=True, check=False,
-                timeout=self.PROCESS_TIMEOUT_SECONDS,
-            )
-            if proc2.returncode != 0:
+            proc2_returncode, _, proc2_stderr = self._run_bounded_process(cmd_quant, Path(output_path))
+            if proc2_returncode != 0:
                 return QuantizationResult(
                     success=False,
                     output_path=output_path,
                     format=QuantFormat.GGUF,
-                    error=f"quantize fehlgeschlagen: {proc2.stderr[:500]}",
+                    error=f"quantize fehlgeschlagen: {proc2_stderr[:500]}",
                 )
 
             try:
@@ -314,7 +357,7 @@ class QuantizationHelper:
                 success=False,
                 output_path=output_path,
                 format=QuantFormat.GGUF,
-                error=str(e),
+                error="Quantization failed",
             )
 
     def recommend_format(

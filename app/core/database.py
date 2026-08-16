@@ -14,6 +14,9 @@ elif env == "test":
     DATABASE_FILE = "minisashimi_test.db"
 else:
     DATABASE_FILE = "minisashimi.db"
+# Deployments can place the database on a dedicated writable volume while
+# keeping application code read-only.  The default remains backward compatible.
+DATABASE_FILE = os.getenv("SASHIMI_DATABASE_FILE", DATABASE_FILE)
 DATABASE_URL = f"sqlite:///{DATABASE_FILE}"
 
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})

@@ -105,7 +105,7 @@ class GraphEngine:
 
     def __init__(self, max_iterations_per_node: int = 5) -> None:
         self.nodes: Dict[str, Node] = {}
-        self.edges: List[Edge] = {}
+        self.edges: Dict[str, List[Edge]] = {}
         self._adj: Dict[str, List[Edge]] = {}
         self._entry: Optional[str] = None
         self.max_iterations = max_iterations_per_node

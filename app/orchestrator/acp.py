@@ -74,7 +74,7 @@ class ACPMessage:
         return cls(**d)
 
     def is_expired(self) -> bool:
-        return (time.time() - self.timestamp) > self.ttl_seconds
+        return self.ttl_seconds <= 0 or (time.time() - self.timestamp) > self.ttl_seconds
 
 
 class ACPBus:
@@ -110,7 +110,12 @@ class ACPBus:
             logger.warning(f"ACP: Message {message.message_id} bereits abgelaufen.")
             return 0
 
-        if len(json.dumps(message.payload)) > self.MAX_PAYLOAD_BYTES:
+        try:
+            payload_size = len(json.dumps(message.payload, ensure_ascii=False).encode("utf-8"))
+        except (TypeError, ValueError):
+            logger.error("ACP: Payload is not JSON serializable")
+            return 0
+        if payload_size > self.MAX_PAYLOAD_BYTES:
             logger.error(
                 f"ACP: Payload zu groß "
                 f"(>{self.MAX_PAYLOAD_BYTES} bytes). Verworfen."
@@ -121,7 +126,9 @@ class ACPBus:
         if len(self._history) > self.MAX_HISTORY:
             self._history = self._history[-self.MAX_HISTORY:]
 
-        handlers = self._subscribers.get(message.recipient, [])
+        # Copy subscriber lists before awaiting handlers; subscriptions may be
+        # changed by a handler and must not alter this delivery pass.
+        handlers = list(self._subscribers.get(message.recipient, []))
         delivered = 0
         for handler in handlers:
             try:
@@ -135,7 +142,8 @@ class ACPBus:
                 )
 
         if message.intent == ACPIntent.BROADCAST:
-            for recipient, subs in self._subscribers.items():
+            for recipient, subs in list(self._subscribers.items()):
+                subs = list(subs)
                 if recipient == message.recipient:
                     continue
                 for handler in subs:

@@ -1,13 +1,14 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { 
   Activity, Settings, ShieldCheck, Key, Cpu, AlertTriangle, 
-  Play, Square, DollarSign, RefreshCw, Layers, CheckCircle2, 
-  XCircle, Clock, Database, User, Terminal, Monitor
+  Square, CheckCircle2,
+  XCircle, Terminal, Monitor
 } from 'lucide-react';
 import './App.css';
+import { capLogEntries, getApiBase, getWebSocketUrl, parseWebSocketMessage } from './security.js';
 
-const API_BASE = "http://localhost:8000";
-const WS_URL = "ws://localhost:8000/ws";
+const API_BASE = getApiBase();
+const WS_URL = getWebSocketUrl(API_BASE);
 
 const formatWorkflowDateTime = (dateTimeStr) => {
   if (!dateTimeStr) return '';
@@ -122,6 +123,7 @@ function App() {
   });
 
   const wsRef = useRef(null);
+  const reconnectTimerRef = useRef(null);
   const terminalBodyRef = useRef(null);
   
   // Live Logger State
@@ -167,8 +169,12 @@ function App() {
     fetchSettings();
 
     return () => {
+      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
       if (wsRef.current) wsRef.current.close();
     };
+  // These helpers intentionally use the current authenticated session.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tokenValid]);
 
   const handleAuthError = () => {
@@ -198,7 +204,7 @@ function App() {
       } else {
         setAuthError("Ungültiger Access Token.");
       }
-    } catch (e) {
+    } catch {
       setAuthError("Verbindung zum Server fehlgeschlagen.");
     }
   };
@@ -224,6 +230,14 @@ function App() {
   };
 
   // WebSocket Verbindung
+  const scheduleWebSocketReconnect = () => {
+    if (reconnectTimerRef.current || !tokenValid) return;
+    reconnectTimerRef.current = setTimeout(() => {
+      reconnectTimerRef.current = null;
+      if (tokenValid) connectWebSocket();
+    }, 3000);
+  };
+
   const connectWebSocket = async () => {
     try {
       const res = await authedFetch(`${API_BASE}/api/ws-ticket`, { method: 'POST' });
@@ -239,7 +253,8 @@ function App() {
       };
 
       ws.onmessage = (event) => {
-        const msg = JSON.parse(event.data);
+        const msg = parseWebSocketMessage(event.data);
+        if (!msg) return;
         if (msg.type === 'error' && msg.message === 'Unauthorized') {
           handleAuthError();
           return;
@@ -259,7 +274,7 @@ function App() {
         } else if (msg.type === 'log_event') {
           setLogs(prev => {
             const updated = [...prev, msg.data];
-            return updated.slice(-300); // Max 300 logs in frontend memory
+            return capLogEntries(updated); // Max 300 logs in frontend memory
           });
         }
       };
@@ -267,20 +282,12 @@ function App() {
       ws.onclose = () => {
         setWsConnected(false);
         console.log("WebSocket getrennt. Reconnect in 3s...");
-        setTimeout(() => {
-          if (tokenValid) {
-            connectWebSocket();
-          }
-        }, 3000);
+        scheduleWebSocketReconnect();
       };
     } catch (e) {
       console.error("Fehler beim Herstellen der WebSocket-Verbindung:", e);
       setWsConnected(false);
-      setTimeout(() => {
-        if (tokenValid) {
-          connectWebSocket();
-        }
-      }, 3000);
+      scheduleWebSocketReconnect();
     }
   };
 
@@ -319,7 +326,7 @@ function App() {
         setInputKeys(prev => ({ ...prev, [provider]: '' }));
         fetchKeys();
       }
-    } catch (e) {
+    } catch {
       window.alert("Fehler beim Speichern des Keys.");
     }
   };
@@ -337,7 +344,7 @@ function App() {
       } else {
         window.alert("Fehler beim Löschen des Keys.");
       }
-    } catch (e) {
+    } catch {
       window.alert("Fehler beim Löschen des Keys.");
     }
   };
@@ -352,7 +359,7 @@ function App() {
         window.alert("Systemeinstellungen erfolgreich gespeichert!");
         fetchSettings();
       }
-    } catch (e) {
+    } catch {
       window.alert("Fehler beim Speichern der Einstellungen.");
     }
   };
@@ -394,7 +401,7 @@ function App() {
         const errData = await res.json().catch(() => ({}));
         window.alert(`Fehler beim Löschen: ${errData.detail || 'Unbekannter Fehler'}`);
       }
-    } catch (e) {
+    } catch {
       window.alert("Fehler beim Verbinden mit der API.");
     }
   };

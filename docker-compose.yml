@@ -7,9 +7,21 @@ services:
       dockerfile: docker/backend.Dockerfile
     ports:
       - "127.0.0.1:8000:8000"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
     volumes:
-      - ./app:/app/app
-      - db_data:/app
+      - ./app:/app/app:ro
+      - db_data:/app/data
+      - keys_data:/app/keys
+      - audit_data:/app/audit
+      - models_data:/app/models
+      - datasets_data:/app/datasets
+      - artifacts_data:/app/artifacts
     environment:
       - PYTHONUNBUFFERED=1
       - SASHIMI_ENCRYPTION_KEY=${SASHIMI_ENCRYPTION_KEY:-}
@@ -17,6 +29,11 @@ services:
       - SASHIMI_ENCRYPTION_SALT=${SASHIMI_ENCRYPTION_SALT:-}
       - SASHIMI_KEYS_DIR=/app/keys
       - SASHIMI_AUDIT_DIR=/app/audit
+      - SASHIMI_DATABASE_FILE=/app/data/minisashimi.db
+      - SASHIMI_MODEL_ROOT=/app/models
+      - SASHIMI_DATASET_ROOT=/app/datasets
+      - SASHIMI_ARTIFACT_ROOT=/app/artifacts
+      - SASHIMI_LLAMA_CPP_ROOT=/app/llama.cpp
     deploy:
       resources:
         limits:
@@ -31,7 +48,7 @@ services:
     ports:
       - "127.0.0.1:5173:5173"
     volumes:
-      - ./dashboard:/app
+      - ./dashboard:/app:ro
     command: sh -c "npm run dev -- --host 0.0.0.0"
     depends_on:
       - backend
@@ -44,4 +61,9 @@ services:
 
 volumes:
   db_data:
+  keys_data:
+  audit_data:
+  models_data:
+  datasets_data:
+  artifacts_data:
 

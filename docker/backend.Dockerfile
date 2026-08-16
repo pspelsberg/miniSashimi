@@ -11,7 +11,7 @@ COPY --from=builder /root/.local /home/appuser/.local
 COPY ./app /app/app
 ENV PATH=/home/appuser/.local/bin:$PATH
 # Berechtigung für SQLite-Datenbank erstellen
-RUN touch /app/minisashimi.db && mkdir -p /app/keys /app/audit && chown -R appuser:appgroup /app
+RUN mkdir -p /app/data /app/keys /app/audit /app/models /app/datasets /app/artifacts /app/llama.cpp && touch /app/data/minisashimi.db && chown -R appuser:appgroup /app
 USER appuser
 EXPOSE 8000
 ENTRYPOINT ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

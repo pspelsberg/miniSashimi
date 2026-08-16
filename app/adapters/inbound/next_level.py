@@ -16,19 +16,29 @@ REST-API für die Skill Builder Next-Level-Path Features:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import logging
 import re
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.adapters.inbound.rest import verify_token
 from app.middleware.rate_limiter import rate_limit
+from app.core.security import sanitize_value
 
 JOB_SEMAPHORE = asyncio.Semaphore(2)
+logger = logging.getLogger("minisashimi.next_level")
 MODEL_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.:/-]+)?$")
-MAX_TEXT_LEN = 100_000
+MAX_TEXT_LEN = 32_000
+MAX_DPO_JOB_SECONDS = max(60, min(int(os.getenv("SASHIMI_DPO_JOB_TIMEOUT_SECONDS", "3600")), 7200))
+ALLOWED_ACP_AGENTS = {
+    entry.strip()
+    for entry in os.getenv("SASHIMI_ACP_AGENTS", "dashboard,thinker,conductor,worker,verifier,security,synthesis").split(",")
+    if entry.strip()
+}
 
 
 def validate_model_name(value: str) -> str:
@@ -95,21 +105,17 @@ async def humaneval_run(req: HumanEvalRunRequest, http_request: Request) -> Dict
     from app.evaluation.humaneval_runner import HumanEvalRunner
 
     runner = HumanEvalRunner(model=req.model, temperature=req.temperature)
-    if req.sample:
-        problems = runner.load_sample_problems()
-    elif req.jsonl_path:
-        async with JOB_SEMAPHORE:
-            problems = runner.load_problems(req.jsonl_path)
-    else:
-        raise HTTPException(
-            status_code=400,
-            detail="Entweder 'jsonl_path' oder 'sample=true' angeben.",
-        )
-
     if req.jsonl_path and not req.sample:
         raise HTTPException(
             status_code=403,
             detail="HumanEval-Datasets sind deaktiviert. Verwende 'sample=true' oder konfiguriere SASHIMI_ENABLE_CODE_EXECUTION zusammen mit SASHIMI_SANDBOX_COMMAND.",
+        )
+    if req.sample:
+        problems = runner.load_sample_problems()
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Nur 'sample=true' ist für diese API aktiviert.",
         )
 
     async with JOB_SEMAPHORE:
@@ -198,7 +204,7 @@ class DPOPairInput(BaseModel):
 
 class DPORequest(BaseModel):
     model_name: str = Field(min_length=1, max_length=256)
-    pairs: List[DPOPairInput] = Field(min_length=1, max_length=1000)
+    pairs: List[DPOPairInput] = Field(min_length=1, max_length=256)
     output_dir: str = Field(default="./artifacts/dpo_output", max_length=4096)
     num_epochs: int = Field(default=3, ge=1, le=20)
     learning_rate: float = Field(default=5e-7, gt=0.0, le=1.0)
@@ -209,15 +215,51 @@ class DPORequest(BaseModel):
     def _validate_model(cls, value: str) -> str:
         return validate_model_name(value)
 
+    @model_validator(mode="after")
+    def _validate_payload_size(self):
+        try:
+            size = len(json.dumps(
+                [pair.model_dump(mode="json") for pair in self.pairs],
+                ensure_ascii=False,
+            ).encode("utf-8"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("DPO pairs must be JSON serializable") from exc
+        if size > 8_000_000:
+            raise ValueError("DPO payload exceeds the maximum length")
+        return self
+
 
 class SyntheticPreferencesRequest(BaseModel):
-    good_outputs: List[Dict[str, Any]] = Field(min_length=1, max_length=1000)
-    bad_outputs: List[Dict[str, Any]] = Field(min_length=1, max_length=1000)
+    good_outputs: List[Dict[str, Any]] = Field(min_length=1, max_length=256)
+    bad_outputs: List[Dict[str, Any]] = Field(min_length=1, max_length=256)
+
+    @field_validator("good_outputs", "bad_outputs")
+    @classmethod
+    def _validate_output_size(cls, value: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        import json
+        if len(json.dumps(value, ensure_ascii=False).encode("utf-8")) > 10_000_000:
+            raise ValueError("preference payload too large")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_total_output_size(self):
+        try:
+            size = len(json.dumps(
+                {"good": self.good_outputs, "bad": self.bad_outputs},
+                ensure_ascii=False,
+            ).encode("utf-8"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("preference payload must be JSON serializable") from exc
+        if size > 8_000_000:
+            raise ValueError("preference payload too large")
+        return self
 
 
 @router.post("/dpo")
 async def dpo_train(req: DPORequest) -> Dict[str, Any]:
-    async with JOB_SEMAPHORE:
+    await JOB_SEMAPHORE.acquire()
+    training_task = None
+    try:
         from app.finetuning.dpo_trainer import DPOTrainer, DPOConfig, PreferencePair
 
         trainer = DPOTrainer(model_name=req.model_name)
@@ -237,16 +279,46 @@ async def dpo_train(req: DPORequest) -> Dict[str, Any]:
             learning_rate=req.learning_rate,
             batch_size=req.batch_size,
         )
-        result = await asyncio.to_thread(trainer.train, pairs, config)
-    return {
-        "success": result.success,
-        "output_dir": result.output_dir,
-        "final_loss": result.final_loss,
-        "training_time_s": result.training_time_s,
-        "steps_completed": result.steps_completed,
-        "error": result.error,
-        "metrics": result.metrics,
-    }
+        # DPOTrainer.train is async at its public seam but performs heavyweight
+        # synchronous transformer work internally. Keep the API loop responsive.
+        def run_training():
+            return asyncio.run(trainer.train(pairs, config))
+
+        training_task = asyncio.create_task(asyncio.to_thread(run_training))
+        try:
+            result = await asyncio.wait_for(
+                asyncio.shield(training_task),
+                timeout=MAX_DPO_JOB_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            # Do not cancel a running transformer thread unsafely. Keep the job
+            # slot occupied until it really exits, preventing hidden concurrency.
+            training_task.add_done_callback(lambda _: JOB_SEMAPHORE.release())
+            training_task = None
+            return {
+                "success": False,
+                "output_dir": config.output_dir,
+                "final_loss": None,
+                "training_time_s": float(MAX_DPO_JOB_SECONDS),
+                "steps_completed": 0,
+                "error": "DPO training timeout",
+                "metrics": {},
+            }
+        return {
+            "success": result.success,
+            "output_dir": result.output_dir,
+            "final_loss": result.final_loss,
+            "training_time_s": result.training_time_s,
+            "steps_completed": result.steps_completed,
+            "error": result.error,
+            "metrics": result.metrics,
+        }
+    finally:
+        if training_task is not None:
+            if training_task.done():
+                JOB_SEMAPHORE.release()
+            else:
+                training_task.add_done_callback(lambda _: JOB_SEMAPHORE.release())
 
 
 @router.post("/dpo/preferences/synthetic")
@@ -289,6 +361,10 @@ async def acp_send(req: ACPSendRequest, http_request: Request) -> Dict[str, Any]
     from app.orchestrator.acp import ACPMessage, ACPIntent, ACPPriority
 
     bus = http_request.app.state.acp_bus
+    # The public dashboard may emit messages only as itself and only to a
+    # registered logical agent.  Do not let a caller spoof an agent identity.
+    if req.sender != "dashboard" or req.recipient not in ALLOWED_ACP_AGENTS:
+        raise HTTPException(status_code=403, detail="ACP sender or recipient is not authorized")
 
     try:
         intent = ACPIntent(req.intent.lower())
@@ -364,5 +440,5 @@ async def validate_handoff(req: ValidateRequest, http_request: Request) -> Dict[
         result = method(req.data)
         return {"valid": True, "data": result.model_dump()}
     except Exception as exc:
-        logger.warning("Handoff validation failed for phase %s: %s", req.phase, exc)
-        return {"valid": False, "error": str(exc)}
+        logger.warning("Handoff validation failed for phase %s: %s", req.phase, sanitize_value(str(exc)))
+        return {"valid": False, "error": "Handoff validation failed"}

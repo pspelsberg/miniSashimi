@@ -1,9 +1,11 @@
 from typing import List, Dict, Optional, Any, Union
 from enum import Enum
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlmodel import SQLModel, Field as SQLField
 from datetime import datetime, timezone
 import uuid
+import json
+import re
 
 class TaskStatus(str, Enum):
     PENDING = "PENDING"
@@ -40,6 +42,7 @@ class WorkflowState(BaseModel):
     completion_tokens: int = 0
     total_tokens: int = 0
     cache_read_tokens: int = 0
+    error: Optional[str] = None
 
 # SQLModel-Datenbank-Modelle für Persistenz von Keys & Settings
 class ApiKeysTable(SQLModel, table=True):
@@ -83,14 +86,30 @@ class ChatMessage(BaseModel):
     def validate_content_size(cls, value: Optional[Union[str, List[Any]]]):
         if isinstance(value, str) and len(value) > 100_000:
             raise ValueError("message content exceeds the maximum length")
-        if isinstance(value, list) and len(value) > 128:
-            raise ValueError("message content parts exceed the maximum count")
+        if isinstance(value, list):
+            if len(value) > 128:
+                raise ValueError("message content parts exceed the maximum count")
+            try:
+                encoded = json.dumps(value, ensure_ascii=False).encode("utf-8")
+            except (TypeError, ValueError) as exc:
+                raise ValueError("message content must be JSON serializable") from exc
+            if len(encoded) > 100_000:
+                raise ValueError("message content exceeds the maximum length")
         return value
 
 
 class ChatCompletionRequest(BaseModel):
     model: str = Field(min_length=1, max_length=256)
     messages: List[ChatMessage] = Field(min_length=1, max_length=100)
+
+    @field_validator("model")
+    @classmethod
+    def validate_model_name(cls, value: str) -> str:
+        # Provider/model identifiers are later logged and used for routing.
+        # Reject control characters and delimiters before they reach either sink.
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.:/-]+)?", value):
+            raise ValueError("invalid model identifier")
+        return value
     temperature: Optional[float] = Field(default=1.0, ge=0.0, le=2.0)
     top_p: Optional[float] = Field(default=1.0, ge=0.0, le=1.0)
     n: Optional[int] = Field(default=1, ge=1, le=8)
@@ -102,6 +121,32 @@ class ChatCompletionRequest(BaseModel):
     user: Optional[str] = Field(default=None, max_length=256)
     tools: Optional[List[Dict[str, Any]]] = Field(default=None, max_length=32)
     tool_choice: Optional[Union[str, Dict[str, Any]]] = None
+
+    @field_validator("tools")
+    @classmethod
+    def validate_tools_size(cls, value: Optional[List[Dict[str, Any]]]):
+        if value is not None:
+            try:
+                if len(json.dumps(value, ensure_ascii=False).encode("utf-8")) > 256_000:
+                    raise ValueError("tools payload exceeds the maximum length")
+            except (TypeError, ValueError) as exc:
+                if isinstance(exc, ValueError) and str(exc).startswith("tools payload"):
+                    raise
+                raise ValueError("tools must be JSON serializable") from exc
+        return value
+
+    @model_validator(mode="after")
+    def validate_request_size(self):
+        try:
+            encoded = json.dumps(
+                [message.model_dump(mode="json") for message in self.messages],
+                ensure_ascii=False,
+            ).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise ValueError("messages must be JSON serializable") from exc
+        if len(encoded) > 2_000_000:
+            raise ValueError("messages payload exceeds the maximum length")
+        return self
 
 class ChatCompletionChoice(BaseModel):
     index: int

@@ -21,6 +21,8 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from app.core.security import sanitize_value
+
 from app.orchestrator.engine import (
     OrchestratorEngine,
     parse_conductor_tasks,
@@ -146,7 +148,7 @@ class GraphOrchestrator(OrchestratorEngine):
         except asyncio.TimeoutError:
             self.state.status = "FAILED" if hasattr(self.state, "status") else "FAILED"
             self.state.completed_at = datetime.now(timezone.utc)
-            self.state.error = f"Workflow-Timeout von {timeout_val} Sekunden ueberschritten."
+            self.state.error = "Workflow-Timeout ueberschritten."
             if self.state.tasks:
                 last_task = self.state.tasks[-1]
                 if last_task.status.value in ("RUNNING", "PENDING"):
@@ -186,16 +188,16 @@ class GraphOrchestrator(OrchestratorEngine):
             await self.stream_queue.put(f"\n\n❌ **Workflow abgebrochen:** {str(e)}\n")
             raise e
         except Exception as e:
-            logger.error(f"Schwerer Fehler im GraphOrchestrator {self.workflow_id}: {e}")
+            logger.error("Schwerer Fehler im GraphOrchestrator %s: %s", self.workflow_id, sanitize_value(str(e)))
             self.state.status = "FAILED"
             self.state.completed_at = datetime.now(timezone.utc)
             if self.state.tasks:
                 last_task = self.state.tasks[-1]
                 if last_task.status.value == "RUNNING":
                     last_task.status = "FAILED"
-                    last_task.error = str(e)
+                    last_task.error = "Interner Fehler bei der Workflow-Verarbeitung."
             await notify_dashboard(self.workflow_id)
-            await self.stream_queue.put(f"\n\n❌ **Schwerer Fehler im Workflow:** {str(e)}\n")
+            await self.stream_queue.put("\n\n❌ **Interner Fehler bei der Workflow-Verarbeitung.**\n")
             raise e
         finally:
             await self.stream_queue.put(None)

@@ -100,7 +100,7 @@ class HybridMemory:
         self.window_size = window_size
         self.max_entries = max(window_size, max_entries)
         self._window: Deque[MemoryEntry] = deque(maxlen=window_size)
-        self._all: List[MemoryEntry] = []
+        self._all: Deque[MemoryEntry] = deque()
         self._store = LanceDBStore(uri=lancedb_uri, table_name=table_name)
         self._embedder = Embedder()
         self._lock = asyncio.Lock()
@@ -159,7 +159,7 @@ class HybridMemory:
 
             # F-005: Enforce capacity limit — evict oldest entries into vector store (CWE-400)
             while len(self._all) > self.max_entries:
-                oldest = self._all.pop(0)
+                oldest = self._all.popleft()
                 if oldest.embedding:
                     await self._store.upsert(
                         text=oldest.text,

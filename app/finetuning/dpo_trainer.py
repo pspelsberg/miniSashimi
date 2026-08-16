@@ -315,11 +315,11 @@ class DPOTrainer:
                 metrics=metrics,
             )
         except Exception as e:
-            logger.error(f"DPO-Training fehlgeschlagen: {e}")
+            logger.error("DPO-Training fehlgeschlagen: %s", str(e))
             return DPOTrainingResult(
                 success=False,
                 output_dir=config.output_dir,
-                error=str(e),
+                error="DPO training failed",
             )
 
     def export_gguf_after_dpo(

@@ -9,7 +9,7 @@ from pydantic import BaseModel, model_validator
 
 from app.domain.models import Task, WorkflowState, TaskStatus
 from app.core.database import get_setting
-from app.core.security import log_audit_event
+from app.core.security import log_audit_event, sanitize_value
 from app.adapters.outbound.llm.client import call_llm
 from app.middleware.anonymizer import Anonymizer
 
@@ -339,7 +339,7 @@ class OrchestratorEngine:
                     last_task.completed_at = datetime.now(timezone.utc)
             self.state.error = "Workflow-Timeout ueberschritten."
             await notify_dashboard(self.workflow_id)
-            raise ValueError(f"Workflow-Timeout von {timeout_val} Sekunden ueberschritten.")
+            raise ValueError("Workflow-Timeout ueberschritten.")
 
     async def _run_internal(self) -> str:
         try:
@@ -523,12 +523,16 @@ class OrchestratorEngine:
             await self.stream_queue.put(f"\n\n❌ **Workflow abgebrochen:** {str(e)}\n")
             raise e
         except Exception as e:
-            logger.error(f"Schwerer Fehler im Workflow {self.workflow_id}: {str(e)}")
+            # Do not expose provider responses, paths, prompts, or credentials
+            # through workflow state, SSE, or the dashboard.
+            safe_detail = "Interner Fehler bei der Workflow-Verarbeitung."
+            logger.error("Schwerer Fehler im Workflow %s: %s", self.workflow_id, sanitize_value(str(e)))
             self.state.status = TaskStatus.FAILED
             self.state.completed_at = datetime.now(timezone.utc)
+            self.state.error = safe_detail
             log_audit_event("workflow_failed", {
                 "workflow_id": self.workflow_id,
-                "error": str(e),
+                "error": sanitize_value(str(e)),
                 "cost_usd": self.state.accumulated_cost_usd
             })
             # Markiere den aktuellen Task als fehlgeschlagen
@@ -536,9 +540,9 @@ class OrchestratorEngine:
                 last_task = self.state.tasks[-1]
                 if last_task.status == TaskStatus.RUNNING:
                     last_task.status = TaskStatus.FAILED
-                    last_task.error = str(e)
+                    last_task.error = safe_detail
             await notify_dashboard(self.workflow_id)
-            await self.stream_queue.put(f"\n\n❌ **Schwerer Fehler im Workflow:** {str(e)}\n")
+            await self.stream_queue.put(f"\n\n❌ **{safe_detail}**\n")
             raise e
         finally:
             await self.stream_queue.put(None)

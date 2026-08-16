@@ -212,11 +212,12 @@ class HumanEvalRunner:
                 error="completion_timeout",
             )
         except Exception as e:
+            logger.error("HumanEval completion failed for %s: %s", problem.task_id, str(e))
             return HumanEvalResult(
                 task_id=problem.task_id,
                 passed=False,
                 completion="",
-                error=str(e),
+                error="completion_failed",
             )
 
     async def run(self, problems: List[HumanEvalProblem]) -> BenchmarkSummary:
@@ -257,6 +258,46 @@ class HumanEvalRunner:
         )
         return summary
 
+    @staticmethod
+    def _build_bwrap_command(raw_command: str, workdir: str, script_path: Path) -> List[str]:
+        """Build a deny-by-default bubblewrap command.
+
+        The operator configuration must contain ``{workdir}`` and ``{script}``
+        placeholders.  A tmpfs root and explicit read-only runtime mounts keep
+        candidate code away from application volumes and host secrets.
+        """
+        parts = shlex.split(raw_command)
+        required = [
+            "--unshare-net", "--unshare-pid", "--unshare-ipc", "--unshare-uts",
+            "--unshare-user", "--die-with-parent", "--new-session", "--clearenv",
+            "--tmpfs", "/", "--bind", "{workdir}", "/work",
+            "--chdir", "/work", "--uid", "65534", "--gid", "65534",
+            "--ro-bind", "/usr", "/usr", "--ro-bind", "/bin", "/bin",
+            "--ro-bind", "/lib", "/lib",
+        ]
+        if any(token not in parts for token in required) or "{script}" not in parts:
+            raise ValueError("bwrap command lacks mandatory isolation options")
+        forbidden_mount_options = {"--dev-bind", "--dev-bind-try", "--bind-try", "--ro-bind-try"}
+        if forbidden_mount_options.intersection(parts):
+            raise ValueError("optional or device mounts are not allowed")
+        for index, token in enumerate(parts):
+            if token == "--bind":
+                if parts[index:index + 3] != ["--bind", "{workdir}", "/work"]:
+                    raise ValueError("only the generated workdir may be bind-mounted")
+            if token == "--ro-bind":
+                source = parts[index + 1] if index + 1 < len(parts) else ""
+                target = parts[index + 2] if index + 2 < len(parts) else ""
+                if (source, target) not in {
+                    ("/usr", "/usr"), ("/bin", "/bin"), ("/lib", "/lib"),
+                }:
+                    raise ValueError("runtime mount is outside the allowlist")
+        if not any(token.endswith("python3") for token in parts):
+            raise ValueError("sandbox command must invoke python3 explicitly")
+        return [
+            token.replace("{workdir}", workdir).replace("{script}", "/work/candidate.py")
+            for token in parts
+        ]
+
     def _execute_test(self, problem: HumanEvalProblem, completion: str) -> tuple[bool, Optional[str]]:
         """Execute only through an explicitly configured external sandbox."""
         if not completion.strip():
@@ -266,28 +307,35 @@ class HumanEvalRunner:
 
         import shutil
         sandbox_raw = os.getenv("SASHIMI_SANDBOX_COMMAND", "").strip()
-        sandbox_command = shlex.split(sandbox_raw) if sandbox_raw else []
-        if not sandbox_command:
+        if not sandbox_raw:
             return False, "external_sandbox_not_configured"
-            
-        resolved_bin = shutil.which(sandbox_command[0])
+
+        parsed_sandbox = shlex.split(sandbox_raw)
+        resolved_bin = shutil.which(parsed_sandbox[0]) if parsed_sandbox else None
         if not resolved_bin:
             return False, "external_sandbox_binary_not_found"
-            
         resolved_path = Path(resolved_bin)
-        if resolved_path.name not in {"bwrap", "firejail", "nsjail", "sandbox-exec"}:
-            return False, "external_sandbox_not_configured"
-            
         safe_dirs = {"/bin", "/usr/bin", "/usr/local/bin", "/usr/sbin", "/sbin"}
-        if str(resolved_path.parent) not in safe_dirs:
-            if os.getenv("SASHIMI_ALLOW_CUSTOM_SANDBOX_PATH", "false").lower() != "true":
-                return False, "unsafe_sandbox_binary_location"
+        if resolved_path.name != "bwrap":
+            return False, "sandbox_must_use_bwrap"
+        if str(resolved_path.parent) not in safe_dirs and os.getenv(
+            "SASHIMI_ALLOW_CUSTOM_SANDBOX_PATH", "false"
+        ).lower() != "true":
+            return False, "unsafe_sandbox_binary_location"
 
         full_code = f"{problem.prompt}{completion}\n{problem.test}\ncheck({problem.entry_point})\n"
         with tempfile.TemporaryDirectory(prefix="minisashimi-eval-") as workdir:
             script_path = Path(workdir) / "candidate.py"
             script_path.write_text(full_code, encoding="utf-8")
-            command = sandbox_command + [str(script_path)]
+            # The sandbox runs as nobody. Only the generated, non-secret
+            # working directory is made traversable/readable for that user.
+            os.chmod(workdir, 0o755)
+            os.chmod(script_path, 0o644)
+            try:
+                sandbox_command = self._build_bwrap_command(sandbox_raw, workdir, script_path)
+            except ValueError:
+                return False, "sandbox_isolation_not_configured"
+            command = sandbox_command
             try:
                 proc = subprocess.run(
                     command,

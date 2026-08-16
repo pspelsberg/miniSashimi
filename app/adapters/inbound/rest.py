@@ -9,6 +9,8 @@ import json
 import logging
 import asyncio
 import hashlib
+import math
+import re
 from datetime import datetime, timezone, timedelta
 
 from app.domain.models import (
@@ -23,11 +25,16 @@ from app.core.security import encrypt_key, decrypt_key, log_audit_event
 from app.orchestrator.engine import (
     OrchestratorEngine, active_workflows, register_dashboard_callback
 )
-from app.core.state import active_tasks, active_tickets
-from app.middleware.rate_limiter import rate_limit
+from app.core.state import active_tasks, active_tickets, ws_clients_lock
+from app.middleware.rate_limiter import rate_limit, login_rate_limit
 
 logger = logging.getLogger("minisashimi.rest")
 router = APIRouter()
+try:
+    MAX_CONCURRENT_WORKFLOWS = max(1, min(int(os.getenv("SASHIMI_MAX_CONCURRENT_WORKFLOWS", "8")), 64))
+except ValueError:
+    MAX_CONCURRENT_WORKFLOWS = 8
+WORKFLOW_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_WORKFLOWS)
 
 ALLOWED_PROVIDERS = {"openai", "anthropic", "mistral", "openrouter", "deepseek", "google"}
 SESSION_TTL_SECONDS = 86_400
@@ -68,6 +75,12 @@ def _session_cookie_parts(request: Request) -> Optional[tuple[str, str, int]]:
 
 class LoginPayload(BaseModel):
     token: str = Field(min_length=1, max_length=512)
+
+
+class ApiKeyPayload(BaseModel):
+    # Provider keys are opaque secrets; bound them to prevent oversized body
+    # retention and accidental log/DB amplification.
+    api_key: str = Field(min_length=1, max_length=4096)
 
 
 def uuid_str() -> str:
@@ -211,8 +224,11 @@ def validate_tool_path(raw_path: str) -> str:
 
     if not isinstance(raw_path, str) or not raw_path.strip() or "\x00" in raw_path:
         raise ValueError("Invalid tool path")
-    path = PurePosixPath(raw_path.strip())
-    if path.is_absolute() or ".." in path.parts:
+    candidate = raw_path.strip()
+    if len(candidate) > 4096 or any(ord(ch) < 32 or ord(ch) == 127 for ch in candidate):
+        raise ValueError("Invalid tool path")
+    path = PurePosixPath(candidate)
+    if path.is_absolute() or ".." in path.parts or str(path) in {"", "."}:
         raise ValueError("Tool path must stay within the client workspace")
     return str(path)
 
@@ -360,8 +376,27 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
     else:
         engine_instance = OrchestratorEngine(workflow_id, prompt)
     
+    # Bound total workflow concurrency to protect memory, provider budgets and
+    # the event loop.  Do not queue unbounded attacker-controlled work.
+    try:
+        await asyncio.wait_for(WORKFLOW_SEMAPHORE.acquire(), timeout=0.1)
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(status_code=429, detail="Too many concurrent workflows") from exc
+    slot_released = False
+    streaming_slot_owned = False
+
+    def release_workflow_slot() -> None:
+        nonlocal slot_released
+        if not slot_released:
+            slot_released = True
+            WORKFLOW_SEMAPHORE.release()
+
     # Starte die Orchestrierung in einem Hintergrund-Task
-    workflow_task = asyncio.create_task(engine_instance.run())
+    try:
+        workflow_task = asyncio.create_task(engine_instance.run())
+    except Exception:
+        release_workflow_slot()
+        raise
     active_tasks[workflow_id] = workflow_task
     
     # Monitor-Task zur Ueberwachung des Client-Disconnects
@@ -548,7 +583,9 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                 finally:
                     disconnect_monitor_task.cancel()
                     active_tasks.pop(workflow_id, None)
+                    release_workflow_slot()
 
+            streaming_slot_owned = True
             return StreamingResponse(event_generator(), media_type="text/event-stream")
 
         final_answer = await workflow_task
@@ -606,12 +643,14 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
     finally:
         disconnect_monitor_task.cancel()
         active_tasks.pop(workflow_id, None)
+        if not streaming_slot_owned:
+            release_workflow_slot()
 
 @router.get("/api/verify", dependencies=[Depends(rate_limit)])
 def verify_access(auth: AuthContext = Depends(verify_token)):
     return {"status": "valid", "csrf_token": auth.csrf_token}
 
-@router.post("/api/login", dependencies=[Depends(rate_limit)])
+@router.post("/api/login", dependencies=[Depends(login_rate_limit)])
 def login(payload: LoginPayload, response: Response):
     token = payload.token.strip()
     expected_token = get_or_create_dashboard_token()
@@ -636,7 +675,7 @@ def login(payload: LoginPayload, response: Response):
     return {"status": "ok", "csrf_token": csrf_token}
 
 
-@router.post("/api/logout")
+@router.post("/api/logout", dependencies=[Depends(verify_token)])
 def logout(request: Request, response: Response):
     parts = _session_cookie_parts(request)
     if parts:
@@ -663,11 +702,11 @@ def list_keys():
     return results
 
 @router.post("/api/keys/{provider}", dependencies=[Depends(verify_token), Depends(rate_limit)])
-def update_key(provider: str, payload: Dict[str, str], http_request: Request):
+def update_key(provider: str, payload: ApiKeyPayload, http_request: Request):
     prov = provider.lower().strip()
     if prov not in ALLOWED_PROVIDERS:
         raise HTTPException(status_code=400, detail=f"Ungültiger Provider '{provider}'. Erlaubt sind: {', '.join(ALLOWED_PROVIDERS)}")
-    api_key = payload.get("api_key", "").strip()
+    api_key = payload.api_key.strip()
     if not api_key:
         raise HTTPException(status_code=400, detail="Kein API-Key uebergeben.")
     save_api_key(prov, api_key)
@@ -726,11 +765,13 @@ def update_settings(settings: Dict[str, str], http_request: Request):
         if key in numeric_ranges:
             try:
                 number = float(value)
-            except ValueError as exc:
+            except (TypeError, ValueError) as exc:
                 raise HTTPException(status_code=400, detail="Invalid numeric setting") from exc
             minimum, maximum = numeric_ranges[key]
-            if not minimum <= number <= maximum:
+            if not math.isfinite(number) or not minimum <= number <= maximum:
                 raise HTTPException(status_code=400, detail="Numeric setting out of range")
+        if key.startswith("model_") and not re.fullmatch(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.:/-]+)?", value):
+            raise HTTPException(status_code=400, detail="Invalid model setting")
         if key in {"pii_masking_enabled", "test_mode_enabled"} and value not in {"true", "false"}:
             raise HTTPException(status_code=400, detail="Boolean setting must be true or false")
 
@@ -781,15 +822,19 @@ async def delete_workflow_history(http_request: Request):
     }
     
     from app.core.state import ws_clients
+    async with ws_clients_lock:
+        clients = list(ws_clients)
     dead_clients = []
-    for client in list(ws_clients):
+    for client in clients:
         try:
             await client.send_text(json.dumps(workflows_dump))
         except Exception:
             dead_clients.append(client)
-    for client in dead_clients:
-        if client in ws_clients:
-            ws_clients.remove(client)
+    if dead_clients:
+        async with ws_clients_lock:
+            for client in dead_clients:
+                if client in ws_clients:
+                    ws_clients.remove(client)
             
     client_ip = http_request.client.host if http_request.client else "unknown"
     log_audit_event("workflow_history_deleted", {

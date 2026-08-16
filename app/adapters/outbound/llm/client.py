@@ -5,6 +5,7 @@ import json
 import logging
 import asyncio
 from app.core.database import get_api_key, get_setting
+from app.core.security import sanitize_value
 
 logger = logging.getLogger("minisashimi.llm_client")
 
@@ -56,7 +57,12 @@ async def call_llm(model_string: str, messages: List[Dict[str, str]], temperatur
     
     Gibt (AntwortText, UsageDict) zurück.
     """
-    # Parse Provider und Modellname
+    # Parse Provider und Modellname.  This value originates from settings or
+    # a request and is also written to logs; reject control characters and
+    # shell/URL delimiters at the outbound boundary.
+    import re
+    if not isinstance(model_string, str) or len(model_string) > 256 or not re.fullmatch(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.:/-]+)?", model_string):
+        raise ValueError("Invalid model identifier")
     parts = model_string.split("/", 1)
     if len(parts) == 2:
         provider, model = parts[0].lower(), parts[1]
@@ -171,7 +177,7 @@ async def call_llm(model_string: str, messages: List[Dict[str, str]], temperatur
             except Exception as api_err:
                 err_msg = str(api_err)
                 if "temperature" in err_msg and any(x in err_msg for x in ("support", "value", "default")):
-                    logger.warning(f"Model '{model}' does not support temperature. Retrying without it. Error was: {err_msg}")
+                    logger.warning("Model %s does not support temperature; retrying without it. Error: %s", model, sanitize_value(err_msg))
                     if "temperature" in kwargs:
                         del kwargs["temperature"]
                     response = await client.chat.completions.create(**kwargs)
@@ -203,12 +209,12 @@ async def call_llm(model_string: str, messages: List[Dict[str, str]], temperatur
                 is_auth_error = True
                 
             if is_auth_error:
-                logger.error(f"Kritischer Authentifizierungsfehler ({provider}/{model}). Retry abgebrochen: {str(e)}")
+                logger.error("Kritischer Authentifizierungsfehler (%s/%s). Retry abgebrochen: %s", provider, model, sanitize_value(str(e)))
                 raise e
 
-            logger.warning(f"LLM-Aufruf fehlgeschlagen (Versuch {attempt}/{max_retries}) fuer {provider}/{model}: {str(e)}")
+            logger.warning("LLM-Aufruf fehlgeschlagen (Versuch %s/%s) fuer %s/%s: %s", attempt, max_retries, provider, model, sanitize_value(str(e)))
             if attempt == max_retries:
-                logger.error(f"Schwerer Fehler bei LLM-Aufruf nach {max_retries} Versuchen: {str(e)}")
+                logger.error("Schwerer Fehler bei LLM-Aufruf nach %s Versuchen: %s", max_retries, sanitize_value(str(e)))
                 raise e
             await asyncio.sleep(delay)
             delay *= 2.0  # exponentielles Backoff
@@ -269,9 +275,11 @@ async def _call_anthropic_native(model: str, messages: List[Dict[str, str]], api
         return content, usage
         
     except httpx.HTTPStatusError as e:
-        err_msg = e.response.text
-        logger.error(f"Anthropic HTTP Error: {err_msg}")
-        raise ValueError(f"Anthropic API Fehler: {err_msg}")
+        logger.error("Anthropic HTTP error: status=%s", e.response.status_code)
+        raise ValueError("Anthropic API request failed") from e
+    except (KeyError, IndexError, TypeError, ValueError) as e:
+        logger.error("Ungültige Anthropic-Antwort: %s", sanitize_value(str(e)))
+        raise ValueError("Invalid response from Anthropic API") from e
     except Exception as e:
-        logger.error(f"Fehler bei nativem Anthropic-Aufruf: {str(e)}")
-        raise e
+        logger.error("Fehler bei nativem Anthropic-Aufruf: %s", sanitize_value(str(e)))
+        raise
