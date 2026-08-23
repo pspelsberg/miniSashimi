@@ -1,5 +1,11 @@
-from typing import Optional
+"""Database configuration, schema lifecycle, and key/settings repository for MiniSashimi.
 
+Initializes SQLite database tables using SQLModel/SQLAlchemy, populates default
+routing model matrix configurations, manages encrypted API key storage, and persists
+session metadata using SHA-256 token digests.
+"""
+
+from typing import Optional
 from sqlmodel import SQLModel, create_engine, Session, select
 from app.domain.models import ApiKeysTable, SettingsTable, SessionTable
 from app.core.security import encrypt_key, decrypt_key
@@ -14,25 +20,25 @@ elif env == "test":
     DATABASE_FILE = "minisashimi_test.db"
 else:
     DATABASE_FILE = "minisashimi.db"
-# Deployments can place the database on a dedicated writable volume while
-# keeping application code read-only.  The default remains backward compatible.
+
 DATABASE_FILE = os.getenv("SASHIMI_DATABASE_FILE", DATABASE_FILE)
 DATABASE_URL = f"sqlite:///{DATABASE_FILE}"
 
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 
-def init_db():
-    """Initialisiert die Datenbank-Tabellen und Standardeinstellungen."""
+
+def init_db() -> None:
+    """Initializes database schema, enforces file permissions (0600), and populates default settings."""
     SQLModel.metadata.create_all(engine)
     
-    # Restriktive Dateirechte setzen (0o600) zur Absicherung lokaler Zugriffe (CWE-276)
+    # Restrictive file permissions (0600) to protect database file locally
     if os.path.exists(DATABASE_FILE):
         try:
             os.chmod(DATABASE_FILE, 0o600)
         except OSError:
             pass
     
-    # Standardeinstellungen anlegen falls noch nicht vorhanden (SOTA 2026 - Sonnet 4.6, GLM 5.2, Opus 4.8, ChatGPT 5.5)
+    # Default model matrix routing configuration
     default_settings = {
         "model_thinker": "openrouter/anthropic/claude-4.8-opus",
         "model_conductor": "openrouter/mistralai/mistral-small-latest",
@@ -102,27 +108,30 @@ def init_db():
                     session.add(result)
         session.commit()
 
+
 def get_db_session():
+    """FastAPI dependency yielding a managed SQLModel Session."""
     with Session(engine) as session:
         yield session
 
-# Hilfsfunktionen für API-Keys
+
 def get_api_key(provider: str) -> Optional[str]:
-    """Holt einen API-Key und entschlüsselt ihn."""
+    """Retrieves and decrypts the stored API key for the specified provider."""
     with Session(engine) as session:
         statement = select(ApiKeysTable).where(ApiKeysTable.provider == provider)
         result = session.exec(statement).first()
         if result and result.encrypted_key:
             return decrypt_key(result.encrypted_key)
-    # Fallback auf Environment-Variablen in Nicht-Produktionsumgebungen zur Agent-Isolierung (Zero-Leak)
+    # Non-production environment fallback
     is_prod = os.getenv("SASHIMI_ENV", "production").lower() == "production"
     if not is_prod:
         env_var_name = f"{provider.upper().replace('-', '_')}_API_KEY"
         return os.getenv(env_var_name)
     return None
 
-def save_api_key(provider: str, api_key: str):
-    """Verschlüsselt und speichert einen API-Key."""
+
+def save_api_key(provider: str, api_key: str) -> None:
+    """Encrypts and persists the API key for the specified provider."""
     with Session(engine) as session:
         statement = select(ApiKeysTable).where(ApiKeysTable.provider == provider)
         result = session.exec(statement).first()
@@ -136,8 +145,9 @@ def save_api_key(provider: str, api_key: str):
             session.add(new_key)
         session.commit()
 
+
 def delete_api_key(provider: str) -> bool:
-    """Löscht einen API-Key aus der Datenbank für den gegebenen Provider."""
+    """Deletes the stored API key for the specified provider."""
     with Session(engine) as session:
         statement = select(ApiKeysTable).where(ApiKeysTable.provider == provider)
         result = session.exec(statement).first()
@@ -147,14 +157,17 @@ def delete_api_key(provider: str) -> bool:
             return True
     return False
 
-# Hilfsfunktionen für Settings
+
 def get_setting(key: str, default: str = "") -> str:
+    """Retrieves a configuration setting value from SettingsTable."""
     with Session(engine) as session:
         statement = select(SettingsTable).where(SettingsTable.key == key)
         result = session.exec(statement).first()
         return result.value if result else default
 
-def save_setting(key: str, value: str):
+
+def save_setting(key: str, value: str) -> None:
+    """Updates or creates a configuration key-value pair in SettingsTable."""
     with Session(engine) as session:
         statement = select(SettingsTable).where(SettingsTable.key == key)
         result = session.exec(statement).first()
@@ -169,11 +182,12 @@ def save_setting(key: str, value: str):
 
 
 def _digest(value: str) -> str:
+    """Computes SHA-256 hex digest for credential hashing."""
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def create_session(session_id: str, token: str, csrf_token: str, expires_at: datetime) -> None:
-    """Persist a session using hashes only; raw credentials never enter SQLite."""
+    """Persists session metadata using SHA-256 hashes only (raw tokens never enter database)."""
     with Session(engine) as session:
         session.add(SessionTable(
             session_id=session_id,
@@ -185,6 +199,7 @@ def create_session(session_id: str, token: str, csrf_token: str, expires_at: dat
 
 
 def get_session(session_id: str) -> Optional[SessionTable]:
+    """Retrieves active session and automatically purges expired records."""
     with Session(engine) as session:
         result = session.get(SessionTable, session_id)
         if result is None:
@@ -200,6 +215,7 @@ def get_session(session_id: str) -> Optional[SessionTable]:
 
 
 def delete_session(session_id: str) -> None:
+    """Deletes an active session record upon logout."""
     with Session(engine) as session:
         result = session.get(SessionTable, session_id)
         if result:
@@ -208,6 +224,7 @@ def delete_session(session_id: str) -> None:
 
 
 def delete_expired_sessions() -> int:
+    """Purges all expired sessions from SessionTable."""
     from sqlmodel import delete
 
     with Session(engine) as session:

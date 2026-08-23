@@ -1,15 +1,21 @@
-"""Path and filesystem boundary helpers used by privileged features."""
-from __future__ import annotations
+"""Filesystem isolation and directory boundary enforcement for MiniSashimi.
 
+Provides secure path resolution and containment verification (blocking path traversal,
+symlink escapes, and null-byte injection) along with file/directory size quotas.
+"""
+
+from __future__ import annotations
 import os
 from pathlib import Path
 
 
 class UnsafePathError(ValueError):
-    """Raised when a user-controlled path escapes its configured root."""
+    """Raised when a user-controlled path attempts to escape its configured root directory."""
+    pass
 
 
 def configured_root(env_name: str, default: str) -> Path:
+    """Resolves a configured directory root from environment variables, creating it with 0700 permissions."""
     root = Path(os.getenv(env_name, default)).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
     try:
@@ -20,10 +26,18 @@ def configured_root(env_name: str, default: str) -> Path:
 
 
 def resolve_under_root(raw_path: str, root: Path, *, must_exist: bool = False) -> Path:
-    """Resolve *raw_path* and require it to remain below *root*.
-
-    ``Path.resolve`` follows symlinks, while ``commonpath`` avoids the prefix
-    confusion caused by checks such as ``candidate.startswith('/tmp')``.
+    """Resolves a target path and verifies it strictly resides within the specified root directory.
+    
+    Args:
+        raw_path: Input path string from request or configuration.
+        root: Permitted root Path object.
+        must_exist: If True, raises FileNotFoundError if target does not exist.
+        
+    Returns:
+        Resolved safe Path object.
+        
+    Raises:
+        UnsafePathError: If path contains null bytes or escapes root directory.
     """
     if not isinstance(raw_path, str) or not raw_path.strip() or "\x00" in raw_path:
         raise UnsafePathError("invalid path")
@@ -46,6 +60,7 @@ def resolve_under_root(raw_path: str, root: Path, *, must_exist: bool = False) -
 
 
 def ensure_regular_file(path: Path, *, max_bytes: int) -> None:
+    """Verifies that the target is a regular file and does not exceed the byte size limit."""
     if not path.is_file():
         raise UnsafePathError("path is not a regular file")
     if path.stat().st_size > max_bytes:
@@ -53,6 +68,7 @@ def ensure_regular_file(path: Path, *, max_bytes: int) -> None:
 
 
 def ensure_directory_size(root: Path, *, max_bytes: int) -> int:
+    """Calculates total directory size and ensures it stays within max_bytes limit."""
     total = 0
     for item in root.rglob("*"):
         if item.is_file():

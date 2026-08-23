@@ -1,3 +1,14 @@
+"""Core Multi-Agent Orchestration Engine for MiniSashimi.
+
+Implements the multi-model decomposition and execution pipeline:
+1. Thinker Model: Synthesizes high-level architectural context and requirements.
+2. Conductor Model: Generates JSON-structured parallel/sequential sub-tasks.
+3. Domain Worker Models: Executes backend, frontend, test architecture, and integration tasks.
+4. Anonymizer Middleware: Masks PII before egress and restores entity values on completion.
+5. Real-time WebSocket Telemetry: Streams live execution state to the React dashboard.
+6. Kill-Switch Abort: Enables instant cooperative task cancellation.
+"""
+
 import asyncio
 import json
 import logging

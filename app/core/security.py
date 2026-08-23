@@ -1,9 +1,23 @@
+"""Cryptographic security, credential protection, and SSRF validation for MiniSashimi.
+
+Provides:
+- Symmetric Fernet credential encryption (PBKDF2-HMAC-SHA256 key derivation) for API keys.
+- Secret masking filters (Zero-Leak Policy) to prevent credential disclosure in application logs.
+- Outbound URL and SSRF validators blocking private network ranges, AWS/cloud metadata services (169.254.169.254),
+  and DNS-rebinding tricks.
+- Cryptographically signed tamper-evident audit logging via HMAC-SHA256.
+"""
+
 import os
 import base64
 from cryptography.fernet import Fernet
 import logging
 import re
 from typing import Any
+import json
+import hmac
+import hashlib
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 # Load environment variables from .env if present
@@ -19,8 +33,12 @@ SECRET_MASK_REGEX = re.compile(
     r")"
 )
 
+
 class SecretRedactingFilter(logging.Filter):
+    """Logging filter that scrubs sensitive API tokens, passwords, and private keys from log streams."""
+
     def filter(self, record: logging.LogRecord) -> bool:
+        """Sanitizes the record message and its arguments before logging."""
         def redact(value: Any) -> Any:
             if isinstance(value, str):
                 return SECRET_MASK_REGEX.sub("••••••••••••", value)
@@ -40,7 +58,9 @@ class SecretRedactingFilter(logging.Filter):
             record.args = tuple(redact(arg) for arg in record.args) if isinstance(record.args, tuple) else redact(record.args)
         return True
 
+
 def sanitize_value(val: Any) -> Any:
+    """Recursively replaces detected secret substrings in nested data structures with bullet masks."""
     if isinstance(val, str):
         return SECRET_MASK_REGEX.sub("••••••••••••", val)
     elif isinstance(val, dict):
@@ -49,8 +69,17 @@ def sanitize_value(val: Any) -> Any:
         return [sanitize_value(item) for item in val]
     return val
 
+
 def is_safe_url(url: str, *, allow_loopback: bool = True) -> bool:
-    """Validate an outbound URL against private-network and metadata SSRF targets."""
+    """Validates an outbound URL against private-network and metadata SSRF targets.
+    
+    Args:
+        url: Destination URL string to validate.
+        allow_loopback: If True, allows localhost/loopback addresses for local LLMs (Ollama, LM Studio).
+        
+    Returns:
+        True if URL is verified safe against SSRF vulnerabilities, False otherwise.
+    """
     from urllib.parse import urlparse
     import ipaddress
     import socket
@@ -70,9 +99,7 @@ def is_safe_url(url: str, *, allow_loopback: bool = True) -> bool:
             # Loopback is required for explicitly configured local LLM services.
             if address.is_loopback:
                 return allow_loopback
-            # Translate IPv4-mapped and NAT64-wrapped IPv6 addresses so that
-            # they are evaluated against the embedded IPv4 range instead of
-            # being reported as link-local / reserved by the IPv6 classifier.
+            # Translate IPv4-mapped and NAT64-wrapped IPv6 addresses
             if isinstance(address, ipaddress.IPv6Address):
                 packed = address.packed
                 if packed[:12] == b"\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff":
@@ -96,8 +123,7 @@ def is_safe_url(url: str, *, allow_loopback: bool = True) -> bool:
         if literal is not None:
             return allowed_ip(str(literal))
 
-        # Resolve every returned address; DNS-rebinding or local destinations
-        # are caught when at least one address fails the allowlist.
+        # Resolve every returned address to protect against DNS-rebinding attacks
         try:
             addresses = socket.getaddrinfo(
                 hostname,
@@ -117,7 +143,7 @@ def is_safe_url(url: str, *, allow_loopback: bool = True) -> bool:
 
 
 def allowed_ip_local(raw_ip: str) -> bool:
-    """Local-provider heuristic: loopback or RFC1918, never metadata."""
+    """Local-provider heuristic: loopback or RFC1918 private IP, never cloud metadata service."""
     import ipaddress
     address = ipaddress.ip_address(raw_ip)
     if str(address) == "169.254.169.254":
@@ -139,10 +165,14 @@ def allowed_ip_local(raw_ip: str) -> bool:
 
 
 def is_allowed_base_url(url: str, provider: str) -> bool:
-    """Allow only approved HTTPS provider hosts or explicitly configured local services.
+    """Allows only approved HTTPS provider hosts or explicitly configured local services.
 
-    Local services are the only exception to the public-address policy.  An
-    operator allowlist is intentionally exact-match and never a wildcard.
+    Args:
+        url: Provider endpoint URL.
+        provider: Provider identifier string.
+        
+    Returns:
+        True if the host is explicitly authorized.
     """
     from urllib.parse import urlparse
     import ipaddress
@@ -156,8 +186,6 @@ def is_allowed_base_url(url: str, provider: str) -> bool:
     host = parsed.hostname.lower().rstrip(".")
     local_providers = {"lmstudio", "ollama", "llama.cpp", "llama.ccp", "llamacpp", "llamaccp"}
     if provider in local_providers:
-        # Local LLMs may use loopback/RFC1918 addresses.  Named test/dev
-        # endpoints must be explicitly allowlisted by the operator.
         if host in _extra_hosts():
             return True
         try:
@@ -166,7 +194,7 @@ def is_allowed_base_url(url: str, provider: str) -> bool:
             return is_safe_url(url) and host == "localhost"
         return parsed.scheme == "http" and allowed_ip_local(str(address))
 
-    # Credentials must never be sent to a public provider over plaintext HTTP.
+    # Public credentials must never be transmitted over plaintext HTTP
     if parsed.scheme != "https" or parsed.port not in (None, 443):
         return False
     public_hosts = {
@@ -180,11 +208,13 @@ def is_allowed_base_url(url: str, provider: str) -> bool:
 
 
 def _extra_hosts() -> set[str]:
+    """Returns extra allowed hosts specified via SASHIMI_ALLOWED_BASE_HOSTS."""
     return {
         entry.strip().lower()
         for entry in os.getenv("SASHIMI_ALLOWED_BASE_HOSTS", "").split(",")
         if entry.strip()
     }
+
 
 env = os.getenv("SASHIMI_ENV", "production").lower()
 if env != "production":
@@ -201,7 +231,7 @@ except Exception:
     KEY_FILE = ".enc_key"
     SALT_FILE = ".enc_salt"
 
-# Holen oder Generieren des Salts (Wird bei Erststart generiert, CRA-konform)
+# Load or generate cryptographic salt (mode 0600)
 SASHIMI_ENCRYPTION_SALT = os.getenv("SASHIMI_ENCRYPTION_SALT")
 if not SASHIMI_ENCRYPTION_SALT:
     if os.path.exists(SALT_FILE):
@@ -223,10 +253,7 @@ if not SASHIMI_ENCRYPTION_SALT:
 
 
 def _make_fernet_compatible(key: bytes) -> bytes:
-    """
-    Stellt sicher, dass der Schlüssel Fernet-kompatibel ist (32 url-safe base64-kodierte Bytes).
-    Falls nicht, leiten wir mittels PBKDF2HMAC einen kompatiblen Schlüssel ab.
-    """
+    """Ensures that the key is valid Fernet (32 url-safe base64 bytes), deriving via PBKDF2 if needed."""
     try:
         decoded = base64.urlsafe_b64decode(key)
         if len(decoded) == 32:
@@ -248,24 +275,20 @@ def _make_fernet_compatible(key: bytes) -> bytes:
 
 
 def _get_or_create_key() -> bytes:
-    """
-    Holt den Verschlüsselungsschlüssel aus den Umgebungsvariablen
-    oder generiert einen persistenten Schlüssel in einer lokalen Datei.
-    """
-    # 1. Priorisiere Umgebungsvariable (CRA-konform)
+    """Retrieves or creates a secure symmetric Fernet key with mode 0600 file permissions."""
+    # 1. Prioritize environment variable
     env_key = os.getenv("SASHIMI_ENCRYPTION_KEY")
     if env_key:
         return _make_fernet_compatible(env_key.encode())
 
-    # 2. Nutze lokalen Key-File Fallback
+    # 2. Use local key-file fallback
     if os.path.exists(KEY_FILE):
         with open(KEY_FILE, "rb") as f:
             return _make_fernet_compatible(f.read())
 
-    # 3. Generiere neuen Schlüssel mit kryptographisch sicherem Zufall (CSPRNG)
+    # 3. Generate new CSPRNG Fernet key
     key = Fernet.generate_key()
     
-    # Erstelle die Datei direkt mit restriktiven Rechten über os.open (Mode 0o600) (F-015)
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
     mode = 0o600
     try:
@@ -277,50 +300,43 @@ def _get_or_create_key() -> bytes:
         
     return key
 
-# Fernet Instanz initialisieren
+
+# Initialize Fernet cipher suite
 _key = _get_or_create_key()
 _cipher_suite = Fernet(_key)
 
-# Kryptographisch sicherer Ableitungsschlüssel für Audit-Logs (F-003)
-import hashlib
-import hmac
+# Cryptographically derived HMAC key for audit logs
 _audit_signing_key = hmac.new(_key, b"miniSashimi-Audit-Log-Signing-Key-Salt", hashlib.sha256).digest()
 
 
 def encrypt_key(plain_text: str) -> str:
-    """
-    Verschlüsselt einen API-Key.
-    """
+    """Encrypts plaintext API keys using Fernet symmetric encryption."""
     if not plain_text:
         return ""
     encrypted_text = _cipher_suite.encrypt(plain_text.encode())
     return encrypted_text.decode()
 
+
 def decrypt_key(encrypted_text: str) -> str:
-    """
-    Entschlüsselt einen API-Key.
-    """
+    """Decrypts ciphertext API keys using Fernet symmetric encryption."""
     if not encrypted_text:
         return ""
     try:
         decrypted_text = _cipher_suite.decrypt(encrypted_text.encode())
         return decrypted_text.decode()
     except Exception:
-        # Falls Entschlüsselung fehlschlägt (z. B. Key geändert)
         return ""
 
 
-import json
-import hmac
-import hashlib
-from datetime import datetime, timezone
-
 AUDIT_DIR = os.getenv("SASHIMI_AUDIT_DIR", os.path.expanduser("~/.minisashimi"))
 
-def log_audit_event(event_type: str, details: dict):
-    """
-    Erstellt einen revisionssicheren und signierten Logeintrag für ein Audit-Log (F-030).
-    Sichert sensible Secrets gegen unbeabsichtigtes Leaking (CWE-532 / Zero-Leak-Policy).
+
+def log_audit_event(event_type: str, details: dict) -> None:
+    """Creates a tamper-evident, HMAC-SHA256 signed audit log record (Zero-Leak Policy).
+    
+    Args:
+        event_type: Event category (e.g. 'API_KEY_STORED', 'WORKFLOW_ABORTED').
+        details: Metadata dict sanitized of any raw credentials.
     """
     sanitized_details = sanitize_value(details)
     event = {
@@ -341,5 +357,4 @@ def log_audit_event(event_type: str, details: dict):
         with os.fdopen(fd, "a") as f:
             f.write(log_line)
     except Exception as e:
-        import logging
         logging.getLogger("minisashimi.security").error(f"Failed to write secure audit log: {str(e)}")

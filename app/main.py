@@ -1,3 +1,14 @@
+"""Main FastAPI application entrypoint for MiniSashimi Multi-Agent Proxy.
+
+Implements:
+- Hexagonal Ports & Adapters architecture with FastAPI REST and WebSocket endpoints.
+- OpenAI-compatible /v1/chat/completions reverse proxy.
+- Security boundary middleware: SecretRedactingFilter, RateLimiter, PII Anonymizer,
+  and 16MB request size limiter.
+- Next-Level-Path services: HandoffValidator, ACPBus, HybridMemory, SemanticCache, LLMJudge, GraphEngine.
+- Real-time React dashboard event streaming and cooperative Kill-Switch lifecycle management.
+"""
+
 from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, Header, Query, Request, WebSocketException
 from contextlib import asynccontextmanager
 from fastapi.exceptions import RequestValidationError
