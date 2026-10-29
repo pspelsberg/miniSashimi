@@ -42,7 +42,7 @@ services:
     restart: unless-stopped
 
   dashboard:
-    image: node:20-alpine
+    image: node:22-alpine
     user: "node"
     working_dir: /app
     ports:
